@@ -1,6 +1,9 @@
 import sys
 sys.path.insert(0, './hy3dshape')
 sys.path.insert(0, './hy3dpaint')
+import torch
+print("CUDA available:", torch.cuda.is_available())
+print("Torch CUDA version:", torch.version.cuda)
 
 from PIL import Image
 from hy3dshape.rembg import BackgroundRemover
@@ -39,9 +42,10 @@ conf.multiview_cfg_path = "hy3dpaint/cfgs/hunyuan-paint-pbr.yaml"
 conf.custom_pipeline = "hy3dpaint/hunyuanpaintpbr"
 paint_pipeline = Hunyuan3DPaintPipeline(conf)
 
-output_mesh_path = 'demo_textured.glb'
+output_mesh_path = 'demo_textured.obj'
 output_mesh_path = paint_pipeline(
     mesh_path = "demo.glb", 
     image_path = 'assets/demo.png',
-    output_mesh_path = output_mesh_path
+    output_mesh_path = output_mesh_path,
+    save_glb=False
 )
