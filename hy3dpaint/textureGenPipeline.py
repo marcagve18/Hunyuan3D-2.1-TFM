@@ -18,6 +18,7 @@ import warnings
 warnings.filterwarnings("ignore")
 from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
+from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, AutoencoderKL, EulerDiscreteScheduler
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger("Hunyuan3DPaint")
@@ -30,6 +31,10 @@ class Hunyuan3DPaintConfig:
         self.multiview_pretrained_path = "tencent/Hunyuan3D-2.1"
         self.dino_ckpt_path = "facebook/dinov2-giant"
         self.realesrgan_ckpt_path = "ckpt/RealESRGAN_x4plus.pth"
+        self.sd15_pretrained_path = "marcagve18/baby-face-generation"
+        self.sd15_vae_path = "stabilityai/sd-vae-ft-ema"
+        self.sd15_controlnet_path = "lllyasviel/control_v11f1e_sd15_tile"
+        self.sd15_refine_strength = 0.12
         self.raster_mode = "cr"
         self.bake_mode = "back_sample"
         self.render_size = 1024 * 2
@@ -69,7 +74,71 @@ class Hunyuan3DPaintPipeline:
         logger.info("Loading AI Models...")
         torch.cuda.empty_cache()
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+        
+        logger.info("Loading SD1.5 refinement model...")
+        self.models["sd15_model"] = StableDiffusionImg2ImgPipeline.from_pretrained(
+            self.config.sd15_pretrained_path,
+            torch_dtype=torch.float16,
+        )
+        self.models["sd15_model"].to(self.config.device)
+        logger.info("SD1.5 model loaded.")
         logger.info("Models Loaded.")
+
+    def refine_with_sd15(self, images, prompt="high quality, photorealistic, detailed texture"):
+        if "sd15_model" not in self.models:
+            logger.info("Loading ControlNet model...")
+            self.models["controlnet"] = ControlNetModel.from_pretrained(
+                self.config.sd15_controlnet_path,
+                torch_dtype=torch.float16,
+            )
+            
+            logger.info("Loading VAE...")
+            self.models["vae"] = AutoencoderKL.from_pretrained(
+                self.config.sd15_vae_path,
+                torch_dtype=torch.float16,
+            )
+            
+            logger.info("Loading SD1.5 refinement model with ControlNet...")
+            self.models["sd15_model"] = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+                self.config.sd15_pretrained_path,
+                vae=self.models["vae"],
+                torch_dtype=torch.float16,
+                controlnet=self.models["controlnet"],
+            )
+            self.models["sd15_model"].to(self.config.device)
+            self.models["sd15_model"].safety_checker = None
+            self.models["sd15_model"].enable_xformers_memory_efficient_attention()
+            self.models["sd15_model"].scheduler = EulerDiscreteScheduler.from_config(
+                self.models["sd15_model"].scheduler.config
+            )
+        
+        negative_prompt = "teeth, tooth, open mouth, longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, mutant"
+        
+        refined_images = []
+        for i, img in enumerate(images):
+            logger.info(f"Refining view {i+1}/{len(images)} with SD1.5 ControlNet...")
+            
+            original_size = img.size
+            img_upscaled = img.resize((1024, 1024), Image.LANCZOS)
+            
+            generator = torch.manual_seed(42)
+            
+            refined = self.models["sd15_model"](
+                prompt="Portrait of a white baby smiling",
+                image=img_upscaled,
+                control_image=img_upscaled,
+                strength=self.config.sd15_refine_strength,
+                controlnet_conditioning_scale=0.9,
+                negative_prompt=negative_prompt,
+                guidance_scale=5,
+                generator=generator,
+                num_inference_steps=50,
+                guess_mode=False,
+            ).images[0]
+            
+            refined_downscaled = refined.resize(original_size, Image.LANCZOS)
+            refined_images.append(refined_downscaled)
+        return refined_images
 
     def _img_to_tensor(self, img: Image.Image):
         """Helper to convert PIL Image to the float32 tensor the renderer expects."""
@@ -111,9 +180,9 @@ class Hunyuan3DPaintPipeline:
         image_path=None,
         output_mesh_path=None,
         use_remesh=False,
-        save_glb=True,
+        save_glb=False,
         unwrap_mode='cylindrical',
-        use_cache=True,
+        use_cache=False,
         manual_albedo_dir=None,
         manual_texture_path=None,    
         manual_mr_texture_path=None  
@@ -131,6 +200,7 @@ class Hunyuan3DPaintPipeline:
             logger.info(f"Loading cached unwrapped mesh: {unwrapped_obj}")
             mesh = trimesh.load(unwrapped_obj)
         else:
+            print("not using cache")
             processed_mesh_path = mesh_path
             if use_remesh:
                 processed_mesh_path = os.path.join(inter_dir, "step1_remeshed.obj")
@@ -193,6 +263,19 @@ class Hunyuan3DPaintPipeline:
                 resize_input=True,
             )
             multiviews_pbr["albedo"], multiviews_pbr["mr"] = res["albedo"], res["mr"]
+            
+            logger.info("Refining multiview albedo with SD1.5...")
+            refined_albedo = self.refine_with_sd15(
+                multiviews_pbr["albedo"],
+                prompt="high quality, photorealistic texture, detailed skin pores, realistic lighting"
+            )
+            multiviews_pbr["albedo"] = refined_albedo
+            
+            alb_refined_dir = os.path.join(dbg_dir, "mv_albedo_refined")
+            os.makedirs(alb_refined_dir, exist_ok=True)
+            for i, im in enumerate(refined_albedo): im.save(os.path.join(alb_refined_dir, f"albedo_refined_{i:02d}.png"))
+            logger.info(f"Refined images saved to {alb_refined_dir}")
+            
             os.makedirs(alb_raw_dir, exist_ok=True)
             os.makedirs(mr_raw_dir, exist_ok=True)
             for i, im in enumerate(multiviews_pbr["albedo"]): im.save(os.path.join(alb_raw_dir, f"albedo_{i:02d}.png"))
