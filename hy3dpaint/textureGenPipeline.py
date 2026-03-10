@@ -58,7 +58,7 @@ class Hunyuan3DPaintConfig:
         self.real_data_dir = "/home/maguilar/TFM/sota_tests/data/real_baby_faces"
         self.stylegan2_D_ckpt = os.path.join(_here, "..", "ckpt", "stylegan2-ffhq-1024x1024.pkl")
         self.refine_steps = 150
-        self.refine_lr = 0.001
+        self.refine_lr = 0.002
         self.lr_D = 1e-4  # unused (D is now frozen)
 
 

@@ -3,9 +3,12 @@ SkinTextureRefiner
 ==================
 Post-processing module for the Hunyuan3D-2.1 paint pipeline.
 
-Takes the baked UV texture (which can look plastic on faces), optimises its
-pixel values using an adversarial (WGAN-GP) loss so that renders of the
-textured mesh look like realistic skin.
+Optimises the baked UV texture by maximising the score of a frozen
+pretrained StyleGAN2-FFHQ discriminator on rendered views.
+
+The discriminator is kept completely frozen — only the texture pixels
+are updated.  Identity + TV regularisation prevent the texture from
+drifting far from the inpainted original.
 
 Usage (inserted in textureGenPipeline.py after inpainting):
 
@@ -14,6 +17,7 @@ Usage (inserted in textureGenPipeline.py after inpainting):
         texture_mr=texture_mr,
         render=self.render,
         reference_images=image_style,
+        debug_dir=debug_dir,
     )
 """
 
@@ -21,18 +25,15 @@ import os
 import random
 from typing import Dict, List, Optional, Tuple
 
-import lpips
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
 
 from .discriminator import StyleGAN2Discriminator
-from .losses import adversarial_loss_D, adversarial_loss_G, total_variation
+from .losses import adversarial_loss_G, total_variation
 
-# Imported lazily from the renderer package (same pattern used in MeshRender.py)
 try:
     from DifferentiableRenderer.camera_utils import get_mv_matrix, transform_pos
 except ImportError:
@@ -40,83 +41,37 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Simple image folder dataset (no torchvision dependency required)
-# ---------------------------------------------------------------------------
-
-class _ImageFolderDataset(Dataset):
-    """Load all images from a directory recursively."""
-
-    EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-
-    def __init__(self, root: str, size: int = 512):
-        self.size = size
-        self.paths: List[str] = []
-        for dirpath, _, fnames in os.walk(root):
-            for fn in fnames:
-                if os.path.splitext(fn)[1].lower() in self.EXTS:
-                    self.paths.append(os.path.join(dirpath, fn))
-        if not self.paths:
-            raise FileNotFoundError(f"No images found in {root}")
-
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        img = Image.open(self.paths[idx]).convert("RGB")
-        img = img.resize((self.size, self.size), Image.LANCZOS)
-        arr = np.array(img, dtype=np.float32) / 255.0          # H W 3  [0,1]
-        return torch.tensor(arr).permute(2, 0, 1)               # 3 H W
-
-
-# ---------------------------------------------------------------------------
 # UV-map extraction helpers
 # ---------------------------------------------------------------------------
 
-def _extract_uv_maps(
-    render,
-    viewpoints: List[Tuple[float, float]],
-    resolution: int = 512,
-) -> Tuple[Dict, Dict]:
-    """
-    Precompute per-viewpoint UV coordinate maps and visibility masks.
-
-    Uses the renderer's rasterizer directly (same pattern as MeshRender.back_project)
-    to interpolate UV vertex attributes at each visible pixel.
-
-    Returns:
-        uv_maps:  dict (azim, elev) -> (H, W, 2) tensor in [-1, 1], device=cuda
-        masks:    dict (azim, elev) -> (H, W, 1) tensor in {0, 1},   device=cuda
-    """
+def _extract_uv_maps(render, viewpoints, resolution: int = 512):
     device = render.device
-    proj = render.camera_proj_mat
-
+    proj   = render.camera_proj_mat
     uv_maps: Dict = {}
-    masks: Dict = {}
+    masks:   Dict = {}
 
     with torch.no_grad():
         for azim, elev in viewpoints:
             r_mv = get_mv_matrix(
-                elev=elev,
-                azim=azim,
-                camera_distance=render.camera_distance,
-                center=None,
+                elev=elev, azim=azim,
+                camera_distance=render.camera_distance, center=None,
             )
-            pos_camera = transform_pos(r_mv, render.vtx_pos, keepdim=True)
-            pos_clip = transform_pos(proj, pos_camera)
+            pos_camera = transform_pos(r_mv, render.vtx_pos,  keepdim=True)
+            pos_clip   = transform_pos(proj, pos_camera)
 
-            rast_out, _ = render.raster_rasterize(pos_clip, render.pos_idx, resolution=(resolution, resolution))
-            visible_mask = torch.clamp(rast_out[..., -1:], 0, 1)[0]  # H W 1
+            rast_out, _ = render.raster_rasterize(
+                pos_clip, render.pos_idx, resolution=(resolution, resolution)
+            )
+            visible = torch.clamp(rast_out[..., -1:], 0, 1)[0]   # H W 1
 
-            # Interpolate UV coords at each pixel  (vtx_uv ∈ [0,1])
-            uv, _ = render.raster_interpolate(render.vtx_uv[None, ...], rast_out, render.uv_idx)
-            uv = uv[0]  # H W 2,  values in [0, 1]
+            uv, _ = render.raster_interpolate(
+                render.vtx_uv[None, ...], rast_out, render.uv_idx
+            )
+            uv_norm = uv[0] * 2.0 - 1.0          # H W 2,  [-1, 1]
+            uv_norm = uv_norm * visible           # zero background
 
-            # grid_sample expects coords in [-1, 1]
-            uv_norm = uv * 2.0 - 1.0                     # H W 2
-            uv_norm = uv_norm * visible_mask              # zero out background
-
-            uv_maps[(azim, elev)] = uv_norm.to(device)   # H W 2
-            masks[(azim, elev)] = visible_mask.to(device) # H W 1
+            uv_maps[(azim, elev)] = uv_norm.to(device)
+            masks  [(azim, elev)] = visible.to(device)
 
     return uv_maps, masks
 
@@ -125,175 +80,132 @@ def _extract_uv_maps(
 # Differentiable render via grid_sample
 # ---------------------------------------------------------------------------
 
-def _render_from_texture(
-    tex: torch.Tensor,
-    uv_map: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
+def _render_from_texture(tex, uv_map, mask):
     """
-    Render a view from a texture using precomputed UV coordinates.
-
-    Args:
-        tex:    (1, 3, H_tex, W_tex)  — differentiable, values in [0, 1]
-        uv_map: (H, W, 2)             — fixed, detached, values in [-1, 1]
-        mask:   (H, W, 1)             — fixed, detached, binary
-
-    Returns:
-        (1, 3, H, W) differentiable rendered image in [0, 1]
+    tex    : (1, 3, Ht, Wt) float [0,1]
+    uv_map : (H, W, 2) float [-1,1]
+    mask   : (H, W, 1) float {0,1}
+    Returns (1, 3, H, W) white-background composite in [0,1].
     """
-    grid = uv_map.unsqueeze(0)                          # 1 H W 2
-    rendered = F.grid_sample(
-        tex, grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=True,
-    )                                                   # 1 3 H W
-    mask_4d = mask.permute(2, 0, 1).unsqueeze(0)        # 1 1 H W
-    return rendered * mask_4d
+    grid     = uv_map.unsqueeze(0)
+    rendered = F.grid_sample(tex, grid, mode="bilinear",
+                             padding_mode="border", align_corners=True)
+    mask_4d  = mask.permute(2, 0, 1).unsqueeze(0)
+    return rendered * mask_4d + (1.0 - mask_4d)   # white background
 
 
 # ---------------------------------------------------------------------------
-# Main refiner class
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _to_float_np(arr) -> np.ndarray:
+    if isinstance(arr, torch.Tensor):
+        t = arr.detach().cpu().float()
+        if t.dim() == 4:
+            t = t.squeeze(0)
+        if t.shape[0] in (1, 3, 4):
+            t = t.permute(1, 2, 0)
+        return t.numpy().astype(np.float32)
+    arr = np.asarray(arr)
+    return (arr / 255.0).astype(np.float32) if arr.dtype == np.uint8 else arr.astype(np.float32)
+
+
+def _save_img(arr: np.ndarray, path: str):
+    Image.fromarray((np.clip(arr, 0, 1) * 255).astype(np.uint8)).save(path)
+
+
+# ---------------------------------------------------------------------------
+# Main class
 # ---------------------------------------------------------------------------
 
 class SkinTextureRefiner(nn.Module):
     """
-    Refines a baked UV texture using adversarial training so that
-    renderings look like realistic skin.
+    Refines a baked UV texture using a frozen StyleGAN2-FFHQ discriminator.
+
+    The discriminator score on rendered views acts as a realism signal.
+    Only the texture pixels are optimised — D is fully frozen.
 
     Parameters
     ----------
     D_ckpt_path : str
-        Path to StyleGAN2-ADA-PyTorch FFHQ .pkl checkpoint.
+        Path to the StyleGAN2-ADA-PyTorch FFHQ .pkl checkpoint.
     real_data_dir : str
-        Directory of real reference images (512×512 baby-face crops).
+        Unused (kept for API compatibility).
     num_steps : int
-        Optimisation iterations.
+        Texture optimisation steps.
     lr_tex : float
-        Learning-rate for texture parameters.
+        Adam learning-rate for texture.
     lr_D : float
-        Learning-rate for discriminator fine-tuning.
-    lambda_gp : float
-        Gradient-penalty weight.
+        Unused (kept for API compatibility).
     lambda_adv : float
-        Adversarial loss weight.
-    lambda_perc : float
-        LPIPS perceptual loss weight.
+        Final adversarial loss weight (ramped up from 0 over
+        ``adv_rampup_steps`` to prevent early texture shock).
     lambda_id : float
-        Identity / reconstruction loss weight.
+        Identity regularisation weight (MSE vs original texture).
     lambda_tv : float
         Total-variation smoothness weight.
-    num_views_per_step : int
-        Viewpoints sampled each optimisation step.
-    D_steps : int
-        Discriminator updates per texture update.
+    adv_rampup_steps : int
+        Steps over which lambda_adv linearly ramps to its target.
+    grad_clip : float
+        Gradient-norm clipping for texture parameters.
     refine_resolution : int
-        Resolution at which renders are generated (px).
+        Render resolution during optimisation.
+    num_views_per_step : int
+        Viewpoints sampled each step.
     """
 
     def __init__(
         self,
         D_ckpt_path: str,
-        real_data_dir: str,
-        num_steps: int = 150,
-        lr_tex: float = 0.001,
-        lr_D: float = 1e-4,       # unused — D is frozen
-        lambda_gp: float = 10.0,  # unused — no D training
-        lambda_adv: float = 0.1,
-        lambda_perc: float = 1.0,
-        lambda_id: float = 5.0,
-        lambda_tv: float = 0.01,
-        num_views_per_step: int = 4,
-        D_steps: int = 1,
+        real_data_dir: str     = "",     # unused
+        num_steps: int         = 150,
+        lr_tex: float          = 0.001,
+        lr_D: float            = 0.0,    # unused
+        lambda_adv: float      = 0.15,
+        lambda_id: float       = 50.0,
+        lambda_tv: float       = 0.5,
+        adv_rampup_steps: int  = 50,
+        grad_clip: float       = 0.1,
+        max_delta: float       = 0.04,   # max per-pixel change from original
         refine_resolution: int = 512,
+        num_views_per_step: int = 4,
     ):
         super().__init__()
-
-        self.D_ckpt_path = D_ckpt_path
-        self.real_data_dir = real_data_dir
-        self.num_steps = num_steps
-        self.lr_tex = lr_tex
-        self.lr_D = lr_D
-        self.lambda_gp = lambda_gp
-        self.lambda_adv = lambda_adv
-        self.lambda_perc = lambda_perc
-        self.lambda_id = lambda_id
-        self.lambda_tv = lambda_tv
+        self.D_ckpt_path        = D_ckpt_path
+        self.num_steps          = num_steps
+        self.lr_tex             = lr_tex
+        self.lambda_adv         = lambda_adv
+        self.lambda_id          = lambda_id
+        self.lambda_tv          = lambda_tv
+        self.adv_rampup_steps   = adv_rampup_steps
+        self.grad_clip          = grad_clip
+        self.max_delta          = max_delta
+        self.refine_resolution  = refine_resolution
         self.num_views_per_step = num_views_per_step
-        self.D_steps = D_steps
-        self.refine_resolution = refine_resolution
 
-    # ------------------------------------------------------------------
-    # Public entry point (callable like a function)
     # ------------------------------------------------------------------
 
     def forward(
         self,
-        texture: np.ndarray,
-        texture_mr: np.ndarray,
+        texture,
+        texture_mr,
         render,
         reference_images: Optional[List[Image.Image]] = None,
         debug_dir: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Refine albedo and metallic-roughness textures.
-
-        Args:
-            texture:          (H, W, 3) uint8 numpy array — albedo.
-            texture_mr:       (H, W, 3) uint8 numpy array — metallic-roughness.
-            render:           MeshRender instance (mesh already loaded).
-            reference_images: List of PIL reference images (optional; used for
-                              perceptual loss target if supplied).
-
-        Returns:
-            (refined_texture, refined_texture_mr) as uint8 numpy arrays.
+        Refine albedo and MR textures.
+        Returns (refined_albedo, refined_mr) as float32 numpy [0,1].
         """
         device = "cuda"
-
-        # ---- Debug helpers ------------------------------------------------
-        if debug_dir is not None:
+        if debug_dir:
             os.makedirs(debug_dir, exist_ok=True)
 
-        def _save_debug_views(tex_t: torch.Tensor, tag: str, vp_keys_subset):
-            if debug_dir is None:
-                return
-            with torch.no_grad():
-                for k in vp_keys_subset:
-                    rendered = _render_from_texture(tex_t, uv_maps[k], masks[k])
-                    mask_4d = masks[k].permute(2, 0, 1).unsqueeze(0)
-                    rendered_white = rendered + (1.0 - mask_4d)
-                    img_np = (rendered_white.squeeze(0).permute(1, 2, 0)
-                              .clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-                    fname = f"view_{tag}_az{k[0]:03d}_el{k[1]:+d}.png"
-                    Image.fromarray(img_np).save(os.path.join(debug_dir, fname))
-
-        # ---- Discriminator (frozen — used as a fixed feature extractor) ---
-        # Fine-tuning D alongside the texture causes GAN divergence within
-        # 150 steps on a single texture.  Instead we freeze D and use it as
-        # a stable adversarial signal, similar to perceptual loss.
-        print("[SkinRefiner] Loading StyleGAN2 discriminator …")
+        # ---- Frozen discriminator ----------------------------------------
         D = StyleGAN2Discriminator(self.D_ckpt_path, device=device)
-        D.eval()
-        for p in D.parameters():
-            p.requires_grad_(False)
+        # D is frozen inside StyleGAN2Discriminator.__init__
 
-        # ---- Perceptual loss ----------------------------------------------
-        lpips_fn = lpips.LPIPS(net="vgg").to(device)
-        lpips_fn.eval()
-
-        # ---- Perceptual reference (first reference image if available) ----
-        if reference_images is not None and len(reference_images) > 0:
-            ref_pil = reference_images[0].resize(
-                (self.refine_resolution, self.refine_resolution), Image.LANCZOS
-            ).convert("RGB")
-            ref_np = np.array(ref_pil, dtype=np.float32) / 255.0
-            ref_tensor = (
-                torch.tensor(ref_np).permute(2, 0, 1).unsqueeze(0).to(device)
-            )  # 1 3 H W
-        else:
-            ref_tensor = None
-
-        # ---- Precompute UV maps -------------------------------------------
+        # ---- UV maps --------------------------------------------------------
         print("[SkinRefiner] Precomputing UV maps …")
         viewpoints = [
             (azim, elev)
@@ -309,96 +221,101 @@ class SkinTextureRefiner(nn.Module):
                 t = arr.float().detach().to(device)
             else:
                 arr = np.asarray(arr)
-                if arr.dtype == np.uint8:
-                    t = torch.tensor(arr / 255.0, dtype=torch.float32, device=device)
-                else:
-                    t = torch.tensor(arr, dtype=torch.float32, device=device)
-            if t.dim() == 3:  # H W C → 1 C H W
+                t = torch.tensor(
+                    arr / 255.0 if arr.dtype == np.uint8 else arr,
+                    dtype=torch.float32, device=device,
+                )
+            if t.dim() == 3:
                 t = t.permute(2, 0, 1).unsqueeze(0)
+            t = F.interpolate(t, size=(self.refine_resolution, self.refine_resolution),
+                              mode="bilinear", align_corners=False)
             return t.requires_grad_(True)
 
-        tex = _to_param(texture)
-        tex_mr = _to_param(texture_mr)
-        tex_orig = tex.clone().detach()
-        tex_mr_orig = tex_mr.clone().detach()
+        if isinstance(texture, torch.Tensor):
+            orig_h, orig_w = texture.shape[0], texture.shape[1]
+        else:
+            orig_h, orig_w = np.asarray(texture).shape[:2]
 
-        # Debug views: front, left, right, back at 0° elevation
-        debug_vps = [(0, 0), (90, 0), (180, 0), (270, 0)]
-        debug_vps = [k for k in debug_vps if k in uv_maps]
+        tex         = _to_param(texture)
+        tex_mr      = _to_param(texture_mr)
+        tex_orig    = tex.detach().clone()
+        tex_mr_orig = tex_mr.detach().clone()
 
-        if debug_dir is not None:
-            # Save input texture
-            _tex_np = (tex_orig.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            Image.fromarray(_tex_np).save(os.path.join(debug_dir, "texture_input.png"))
-            # Save reference image
-            if ref_tensor is not None:
-                _ref_np = (ref_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                Image.fromarray(_ref_np).save(os.path.join(debug_dir, "ref_image.png"))
-            # Save pre-optimisation renders
-            _save_debug_views(tex_orig, "before", debug_vps)
-            print(f"[SkinRefiner] Debug images will be saved to: {debug_dir}")
+        optimizer_tex = torch.optim.Adam([tex, tex_mr], lr=self.lr_tex, betas=(0.9, 0.999))
 
-        optimizer_tex = torch.optim.Adam([tex, tex_mr], lr=self.lr_tex)
+        # ---- Debug helpers --------------------------------------------------
+        debug_vps = [k for k in [(0, 0), (90, 0), (180, 0), (270, 0)] if k in uv_maps]
 
-        # ---- Optimisation loop -------------------------------------------
-        # torch.enable_grad() is required because the pipeline __call__ runs
-        # under @torch.no_grad(), which would block all backward passes.
+        def _save_views(t: torch.Tensor, tag: str):
+            if debug_dir is None:
+                return
+            with torch.no_grad():
+                for k in debug_vps:
+                    img = _render_from_texture(t, uv_maps[k], masks[k])
+                    img_np = img.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+                    _save_img(img_np, os.path.join(debug_dir,
+                              f"view_{tag}_az{k[0]:03d}_el{k[1]:+d}.png"))
+
+        if debug_dir:
+            _save_img(_to_float_np(tex_orig),    os.path.join(debug_dir, "texture_input.png"))
+            _save_img(_to_float_np(tex_mr_orig), os.path.join(debug_dir, "texture_mr_input.png"))
+            _save_views(tex_orig, "before")
+            print(f"[SkinRefiner] Debug images → {debug_dir}")
+
+        # ---- Optimisation loop ----------------------------------------------
         print(f"[SkinRefiner] Starting optimisation ({self.num_steps} steps) …")
+
         with torch.enable_grad():
             for step in range(self.num_steps):
+
+                adv_w = self.lambda_adv * min(1.0, (step + 1) / max(1, self.adv_rampup_steps))
 
                 optimizer_tex.zero_grad()
 
                 sel = random.sample(vp_keys, self.num_views_per_step)
-                loss: torch.Tensor = torch.tensor(0.0, device=device)
+                renders = torch.cat([
+                    _render_from_texture(tex, uv_maps[k], masks[k]) for k in sel
+                ], dim=0)                                 # N 3 H W
 
-                for k in sel:
-                    # White background matches the real reference images
-                    rendered = _render_from_texture(tex, uv_maps[k], masks[k])       # 1 3 H W
-                    mask_4d = masks[k].permute(2, 0, 1).unsqueeze(0)                  # 1 1 H W
-                    rendered_white = rendered + (1.0 - mask_4d)                       # white bg
-
-                    # Adversarial: frozen D as a fixed quality signal
-                    loss = loss + self.lambda_adv * adversarial_loss_G(D, rendered_white)
-
-                    # Perceptual: LPIPS against reference image
-                    if ref_tensor is not None and self.lambda_perc > 0:
-                        loss = loss + self.lambda_perc * lpips_fn(rendered_white, ref_tensor).mean()
-
-                loss = loss / self.num_views_per_step
-
-                # Identity: stay close to the original baked texture
-                loss_id = F.mse_loss(tex, tex_orig) + F.mse_loss(tex_mr, tex_mr_orig)
-                loss = loss + self.lambda_id * loss_id
-
-                # Total variation: spatial smoothness
-                loss_tv = total_variation(tex) + total_variation(tex_mr)
-                loss = loss + self.lambda_tv * loss_tv
+                loss_G  = adv_w * adversarial_loss_G(D, renders)
+                loss_id = self.lambda_id * (
+                    F.mse_loss(tex, tex_orig) + F.mse_loss(tex_mr, tex_mr_orig)
+                )
+                loss_tv = self.lambda_tv * (total_variation(tex) + total_variation(tex_mr))
+                loss    = loss_G + loss_id + loss_tv
 
                 loss.backward()
+                nn.utils.clip_grad_norm_([tex, tex_mr], self.grad_clip)
                 optimizer_tex.step()
 
                 with torch.no_grad():
+                    # Per-pixel change clamp: prevents adversarial hallucinations
+                    # from building up over successive steps.
+                    tex.clamp_(tex_orig - self.max_delta, tex_orig + self.max_delta)
                     tex.clamp_(0.0, 1.0)
+                    tex_mr.clamp_(tex_mr_orig - self.max_delta, tex_mr_orig + self.max_delta)
                     tex_mr.clamp_(0.0, 1.0)
 
-                if (step + 1) % 25 == 0:
+                if (step + 1) % 10 == 0:
                     print(
-                        f"[SkinRefiner] step {step + 1}/{self.num_steps} | "
-                        f"loss={loss.item():.4f}  loss_id={loss_id.item():.4f}"
+                        f"[SkinRefiner] step {step + 1:3d}/{self.num_steps} | "
+                        f"loss_G={loss_G.item():+.4f}  "
+                        f"loss_id={loss_id.item():.4f}  "
+                        f"loss_tv={loss_tv.item():.5f}  "
+                        f"adv_w={adv_w:.3f}"
                     )
 
         print("[SkinRefiner] Optimisation complete.")
 
-        # ---- Convert back to float numpy [0, 1] ---------------------------------
-        # set_texture(force_set=True) calls torch.from_numpy() without /255,
-        # so we must return float [0,1] not uint8 [0,255].
-        def _to_numpy(t: torch.Tensor) -> np.ndarray:
-            return t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
+        if debug_dir:
+            _save_views(tex.detach(), "after")
+            _save_img(_to_float_np(tex.detach()),    os.path.join(debug_dir, "texture_output.png"))
+            _save_img(_to_float_np(tex_mr.detach()), os.path.join(debug_dir, "texture_mr_output.png"))
 
-        if debug_dir is not None:
-            _save_debug_views(tex.detach(), "after", debug_vps)
-            _tex_out_u8 = (_to_numpy(tex) * 255).astype(np.uint8)
-            Image.fromarray(_tex_out_u8).save(os.path.join(debug_dir, "texture_output.png"))
+        def _to_numpy(t: torch.Tensor) -> np.ndarray:
+            with torch.no_grad():
+                t_up = F.interpolate(t, size=(orig_h, orig_w),
+                                     mode="bilinear", align_corners=False)
+            return t_up.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
 
         return _to_numpy(tex), _to_numpy(tex_mr)
