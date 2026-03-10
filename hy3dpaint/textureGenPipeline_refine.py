@@ -3,8 +3,9 @@ import torch
 import trimesh
 import numpy as np
 import logging
-import glob
+import matplotlib.pyplot as plt
 from PIL import Image
+import glob
 
 from DifferentiableRenderer.MeshRender import MeshRender
 from utils.simplify_mesh_utils import remesh_mesh
@@ -12,16 +13,15 @@ from utils.multiview_utils import multiviewDiffusionNet
 from utils.pipeline_utils import ViewProcessor
 from utils.uvwrap_utils import mesh_uv_wrap
 from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
-from skin_refine import SkinTextureRefiner
 
 import warnings
 warnings.filterwarnings("ignore")
 from diffusers.utils import logging as diffusers_logging
 diffusers_logging.set_verbosity(50)
+from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, AutoencoderKL, EulerDiscreteScheduler
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger("Hunyuan3DPaint")
-
 
 class Hunyuan3DPaintConfig:
     def __init__(self, max_num_view, resolution):
@@ -31,6 +31,11 @@ class Hunyuan3DPaintConfig:
         self.multiview_pretrained_path = "tencent/Hunyuan3D-2.1"
         self.dino_ckpt_path = "facebook/dinov2-giant"
         self.realesrgan_ckpt_path = "ckpt/RealESRGAN_x4plus.pth"
+        self.sd15_pretrained_path = "marcagve18/baby-face-generation"
+        #self.sd15_pretrained_path = "SG161222/Realistic_Vision_V5.1_noVAE"
+        self.sd15_vae_path = "stabilityai/sd-vae-ft-ema"
+        self.sd15_controlnet_path = "lllyasviel/control_v11f1e_sd15_tile"
+        self.sd15_refine_strength = 0.3
         self.raster_mode = "cr"
         self.bake_mode = "back_sample"
         self.render_size = 1024 * 2
@@ -52,16 +57,6 @@ class Hunyuan3DPaintConfig:
             self.candidate_camera_elevs.append(-20)
             self.candidate_view_weights.append(0.01)
 
-        # Skin refinement settings
-        self.use_skin_refinement = True
-        _here = os.path.dirname(os.path.abspath(__file__))
-        self.real_data_dir = "/home/maguilar/TFM/sota_tests/data/real_baby_faces"
-        self.stylegan2_D_ckpt = os.path.join(_here, "..", "ckpt", "stylegan2-ffhq-1024x1024.pkl")
-        self.refine_steps = 150
-        self.refine_lr = 0.001
-        self.lr_D = 1e-4  # unused (D is now frozen)
-
-
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
         self.config = config if config is not None else Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
@@ -80,19 +75,79 @@ class Hunyuan3DPaintPipeline:
         logger.info("Loading AI Models...")
         torch.cuda.empty_cache()
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
-        if self.config.use_skin_refinement:
-            self.models["skin_refiner"] = SkinTextureRefiner(
-                D_ckpt_path=self.config.stylegan2_D_ckpt,
-                real_data_dir=self.config.real_data_dir,
-                num_steps=self.config.refine_steps,
-                lr_tex=self.config.refine_lr,
-                lr_D=self.config.lr_D,
-            )
+        
+        logger.info("Loading SD1.5 refinement model...")
+        self.models["sd15_model"] = StableDiffusionImg2ImgPipeline.from_pretrained(
+            self.config.sd15_pretrained_path,
+            torch_dtype=torch.float16,
+        )
+        self.models["sd15_model"].to(self.config.device)
+        logger.info("SD1.5 model loaded.")
         logger.info("Models Loaded.")
 
+    def refine_with_sd15(self, images, prompt="high quality, photorealistic, detailed texture"):
+        if "sd15_model" not in self.models:
+            logger.info("Loading ControlNet model...")
+            self.models["controlnet"] = ControlNetModel.from_pretrained(
+                self.config.sd15_controlnet_path,
+                torch_dtype=torch.float16,
+            )
+            
+            logger.info("Loading VAE...")
+            self.models["vae"] = AutoencoderKL.from_pretrained(
+                self.config.sd15_vae_path,
+                torch_dtype=torch.float16,
+            )
+            
+            logger.info("Loading SD1.5 refinement model with ControlNet...")
+            self.models["sd15_model"] = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+                self.config.sd15_pretrained_path,
+                vae=self.models["vae"],
+                torch_dtype=torch.float16,
+                controlnet=self.models["controlnet"],
+            )
+            self.models["sd15_model"].to(self.config.device)
+            self.models["sd15_model"].safety_checker = None
+            self.models["sd15_model"].enable_xformers_memory_efficient_attention()
+            self.models["sd15_model"].scheduler = EulerDiscreteScheduler.from_config(
+                self.models["sd15_model"].scheduler.config
+            )
+        
+        negative_prompt = "teeth, tooth, open mouth, longbody, lowres, bad anatomy, bad hands, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, mutant"
+        
+        refined_images = []
+        for i, img in enumerate(images):
+            logger.info(f"Refining view {i+1}/{len(images)} with SD1.5 ControlNet...")
+            
+            original_size = img.size
+            img_upscaled = img.resize((1024, 1024), Image.LANCZOS)
+            
+            generator = torch.manual_seed(42)
+            
+            refined = self.models["sd15_model"](
+                prompt="Portrait of a white baby smiling",
+                image=img_upscaled,
+                control_image=img_upscaled,
+                strength=self.config.sd15_refine_strength,
+                controlnet_conditioning_scale=0.9,
+                negative_prompt=negative_prompt,
+                guidance_scale=5,
+                generator=generator,
+                num_inference_steps=50,
+                guess_mode=False,
+            ).images[0]
+            
+            refined_downscaled = refined.resize(original_size, Image.LANCZOS)
+            refined_images.append(refined_downscaled)
+        return refined_images
+
     def _img_to_tensor(self, img: Image.Image):
+        """Helper to convert PIL Image to the float32 tensor the renderer expects."""
         img_np = np.array(img).astype(np.float32) / 255.0
         return torch.from_numpy(img_np).to(self.config.device)
+
+    def _ensure_dir(self, p: str):
+        os.makedirs(p, exist_ok=True)
 
     def _load_images_from_dir(self, img_dir: str, pattern: str = "*.png"):
         paths = sorted(glob.glob(os.path.join(img_dir, pattern)))
@@ -103,35 +158,45 @@ class Hunyuan3DPaintPipeline:
     def _apply_baby_skin_material(self, mr_texture: torch.Tensor) -> torch.Tensor:
         """
         Apply baby skin PBR material properties.
-
+        
         For baby skin:
         - Metallic (R channel) ≈ 0 (non-metallic)
         - Roughness (G channel) relatively high with soft micro-variation
+        
+        Args:
+            mr_texture: torch.Tensor of shape [H, W, 3] with values in [0, 1]
+            
+        Returns:
+            Modified torch.Tensor with baby skin material properties
         """
         device = mr_texture.device
         h, w = mr_texture.shape[0], mr_texture.shape[1]
-
+        
         base_roughness = 0.6
+        
         noise = torch.randn(h, w, device=device) * 0.15
-        roughness_variation = torch.clamp(base_roughness + noise, 0.3, 0.85)
-
+        roughness_variation = base_roughness + noise
+        roughness_variation = torch.clamp(roughness_variation, 0.3, 0.85)
+        
         gaussian_kernel_size = 9
         sigma = 3.0
-        x = torch.arange(-gaussian_kernel_size // 2 + 1, gaussian_kernel_size // 2 + 1,
-                         dtype=torch.float32, device=device)
+        x = torch.arange(-gaussian_kernel_size // 2 + 1, gaussian_kernel_size // 2 + 1, dtype=torch.float32, device=device)
         gauss_1d = torch.exp(-x**2 / (2 * sigma**2))
-        gauss_2d = (gauss_1d.unsqueeze(0) * gauss_1d.unsqueeze(1))
-        gauss_2d = (gauss_2d / gauss_2d.sum()).unsqueeze(0).unsqueeze(0)
-
+        gauss_2d = gauss_1d.unsqueeze(0) * gauss_1d.unsqueeze(1)
+        gauss_2d = gauss_2d / gauss_2d.sum()
+        
+        roughness_for_blur = roughness_variation.unsqueeze(0).unsqueeze(0)
+        gauss_2d = gauss_2d.unsqueeze(0).unsqueeze(0)
+        
         pad = gaussian_kernel_size // 2
-        roughness_padded = torch.nn.functional.pad(
-            roughness_variation.unsqueeze(0).unsqueeze(0), (pad, pad, pad, pad), mode='reflect'
-        )
+        roughness_padded = torch.nn.functional.pad(roughness_for_blur, (pad, pad, pad, pad), mode='reflect')
         roughness_smooth = torch.nn.functional.conv2d(roughness_padded, gauss_2d, padding=0)
         roughness_smooth = roughness_smooth.squeeze(0).squeeze(0)
-
+        
         mr_texture[:, :, 0] = 0.0
+        
         mr_texture[:, :, 1] = roughness_smooth
+        
         return mr_texture
 
     def apply_cylindrical_unwrap(self, mesh):
@@ -164,8 +229,8 @@ class Hunyuan3DPaintPipeline:
         unwrap_mode='cylindrical',
         use_cache=False,
         manual_albedo_dir=None,
-        manual_texture_path=None,
-        manual_mr_texture_path=None,
+        manual_texture_path=None,    
+        manual_mr_texture_path=None  
     ):
         input_dir = os.path.dirname(mesh_path)
         if output_mesh_path is None:
@@ -173,7 +238,7 @@ class Hunyuan3DPaintPipeline:
 
         inter_dir = os.path.join(os.path.dirname(output_mesh_path), "intermediates")
         dbg_dir = os.path.join(inter_dir, "debug_images")
-
+        
         # 1 & 2) Mesh & UV
         unwrapped_obj = os.path.join(inter_dir, f"unwrapped_{unwrap_mode}.obj")
         if use_cache and os.path.exists(unwrapped_obj):
@@ -185,14 +250,11 @@ class Hunyuan3DPaintPipeline:
             if use_remesh:
                 processed_mesh_path = os.path.join(inter_dir, "step1_remeshed.obj")
                 remesh_mesh(mesh_path, processed_mesh_path)
-
+            
             mesh = trimesh.load(processed_mesh_path)
-            if unwrap_mode == "cylindrical":
-                mesh = self.apply_cylindrical_unwrap(mesh)
-            elif unwrap_mode == "projective":
-                mesh = self.apply_projective_unwrap(mesh)
-            else:
-                mesh = mesh_uv_wrap(mesh)
+            if unwrap_mode == "cylindrical": mesh = self.apply_cylindrical_unwrap(mesh)
+            elif unwrap_mode == "projective": mesh = self.apply_projective_unwrap(mesh)
+            else: mesh = mesh_uv_wrap(mesh)
             mesh.export(unwrapped_obj)
 
         self.render.load_mesh(mesh=mesh)
@@ -200,11 +262,17 @@ class Hunyuan3DPaintPipeline:
         # --- DIRECT TEXTURE APPLICATION BRANCH ---
         if manual_texture_path and os.path.exists(manual_texture_path):
             logger.info(f"Manual Texture detected: {manual_texture_path}. Applying directly.")
-            tex_tensor = self._img_to_tensor(Image.open(manual_texture_path).convert("RGB"))
+            
+            # Convert PIL to Tensor before calling set_texture
+            tex_pil = Image.open(manual_texture_path).convert("RGB")
+            tex_tensor = self._img_to_tensor(tex_pil)
             self.render.set_texture(tex_tensor, force_set=True)
+            
             if manual_mr_texture_path and os.path.exists(manual_mr_texture_path):
-                mr_tensor = self._img_to_tensor(Image.open(manual_mr_texture_path).convert("RGB"))
+                mr_pil = Image.open(manual_mr_texture_path).convert("RGB")
+                mr_tensor = self._img_to_tensor(mr_pil)
                 self.render.set_texture_mr(mr_tensor)
+            
             self.render.save_mesh(output_mesh_path, downsample=True)
             if save_glb:
                 convert_obj_to_glb(output_mesh_path, output_mesh_path.replace(".obj", ".glb"))
@@ -217,11 +285,11 @@ class Hunyuan3DPaintPipeline:
             self.config.candidate_view_weights, self.config.max_selected_view_num,
         )
 
-        # 4 & 5) Multiview Diffusion (with caching)
+        # 4 & 5) Multiview Diffusion Caching
         alb_raw_dir = os.path.join(dbg_dir, "mv_albedo_raw")
         mr_raw_dir = os.path.join(dbg_dir, "mv_mr_raw")
         multiviews_pbr = {"albedo": [], "mr": []}
-
+        
         if use_cache and os.path.exists(alb_raw_dir) and len(glob.glob(os.path.join(alb_raw_dir, "*.png"))) > 0:
             logger.info("Loading diffusion images from cache...")
             multiviews_pbr["albedo"] = self._load_images_from_dir(alb_raw_dir, "albedo_*.png")
@@ -229,13 +297,9 @@ class Hunyuan3DPaintPipeline:
         else:
             self.load_models()
             image_prompt = Image.open(image_path).convert("RGB")
-            normal_maps = self.view_processor.render_normal_multiview(
-                selected_camera_elevs, selected_camera_azims, use_abs_coor=True
-            )
-            position_maps = self.view_processor.render_position_multiview(
-                selected_camera_elevs, selected_camera_azims
-            )
-
+            normal_maps = self.view_processor.render_normal_multiview(selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
+            position_maps = self.view_processor.render_position_multiview(selected_camera_elevs, selected_camera_azims)
+            
             res = self.models["multiview_model"](
                 [image_prompt.resize((512, 512))],
                 normal_maps + position_maps,
@@ -244,13 +308,23 @@ class Hunyuan3DPaintPipeline:
                 resize_input=True,
             )
             multiviews_pbr["albedo"], multiviews_pbr["mr"] = res["albedo"], res["mr"]
-
+            
+            logger.info("Refining multiview albedo with SD1.5...")
+            refined_albedo = self.refine_with_sd15(
+                multiviews_pbr["albedo"],
+                prompt="high quality, photorealistic texture, detailed skin pores, realistic lighting"
+            )
+            multiviews_pbr["albedo"] = refined_albedo
+            
+            alb_refined_dir = os.path.join(dbg_dir, "mv_albedo_refined")
+            os.makedirs(alb_refined_dir, exist_ok=True)
+            for i, im in enumerate(refined_albedo): im.save(os.path.join(alb_refined_dir, f"albedo_refined_{i:02d}.png"))
+            logger.info(f"Refined images saved to {alb_refined_dir}")
+            
             os.makedirs(alb_raw_dir, exist_ok=True)
             os.makedirs(mr_raw_dir, exist_ok=True)
-            for i, im in enumerate(multiviews_pbr["albedo"]):
-                im.save(os.path.join(alb_raw_dir, f"albedo_{i:02d}.png"))
-            for i, im in enumerate(multiviews_pbr["mr"]):
-                im.save(os.path.join(mr_raw_dir, f"mr_{i:02d}.png"))
+            for i, im in enumerate(multiviews_pbr["albedo"]): im.save(os.path.join(alb_raw_dir, f"albedo_{i:02d}.png"))
+            for i, im in enumerate(multiviews_pbr["mr"]): im.save(os.path.join(mr_raw_dir, f"mr_{i:02d}.png"))
 
         # 6) Preparation for Baking
         enhance_images = {"albedo": [], "mr": []}
@@ -261,42 +335,22 @@ class Hunyuan3DPaintPipeline:
             enhance_images["albedo"].append(alb_img)
             mr_in = multiviews_pbr["mr"][i]
             mr_img = mr_in if isinstance(mr_in, Image.Image) else Image.fromarray(np.asarray(mr_in))
-            enhance_images["mr"].append(
-                mr_img.resize((self.config.render_size, self.config.render_size), Image.LANCZOS)
-            )
+            enhance_images["mr"].append(mr_img.resize((self.config.render_size, self.config.render_size), Image.LANCZOS))
 
         # 7 & 8) Bake & Inpaint
-        texture, mask = self.view_processor.bake_from_multiview(
-            enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights
-        )
+        texture, mask = self.view_processor.bake_from_multiview(enhance_images["albedo"], selected_camera_elevs, selected_camera_azims, selected_view_weights)
         mask_np = (mask.squeeze(-1).detach().cpu().numpy() * 255).astype(np.uint8)
         texture_final = self.view_processor.texture_inpaint(texture, mask_np)
+        
+        # texture_final is usually a tensor here from the inpaint process
         self.render.set_texture(texture_final, force_set=True)
 
-        texture_mr_final = None
         if "mr" in enhance_images:
-            texture_mr, _ = self.view_processor.bake_from_multiview(
-                enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights
-            )
+            texture_mr, _ = self.view_processor.bake_from_multiview(enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights)
             texture_mr_final = self.view_processor.texture_inpaint(texture_mr, mask_np)
+            
             texture_mr_final = self._apply_baby_skin_material(texture_mr_final)
-            self.render.set_texture_mr(texture_mr_final)
-
-        # 9) Skin refinement (optional)
-        if self.config.use_skin_refinement:
-            self.models["multiview_model"].pipeline.to("cpu")
-            torch.cuda.empty_cache()
-
-            image_style = [Image.open(image_path).convert("RGB").resize((512, 512))]
-            _refine_debug = os.path.join(os.path.dirname(output_mesh_path), "skin_refiner_debug")
-            texture_final, texture_mr_final = self.models["skin_refiner"](
-                texture=texture_final,
-                texture_mr=texture_mr_final,
-                render=self.render,
-                reference_images=image_style,
-                debug_dir=_refine_debug,
-            )
-            self.render.set_texture(texture_final, force_set=True)
+            
             self.render.set_texture_mr(texture_mr_final)
 
         # Save outputs
