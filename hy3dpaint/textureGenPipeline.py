@@ -13,6 +13,7 @@ from utils.multiview_utils import multiviewDiffusionNet
 from utils.pipeline_utils import ViewProcessor
 from utils.uvwrap_utils import mesh_uv_wrap
 from DifferentiableRenderer.mesh_utils import convert_obj_to_glb
+from skin_refine import SkinTextureRefiner
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -56,6 +57,16 @@ class Hunyuan3DPaintConfig:
             self.candidate_camera_elevs.append(-20)
             self.candidate_view_weights.append(0.01)
 
+        # Skin texture refinement (GFPGAN-based)
+        self.use_skin_refinement        = True
+        _here = os.path.dirname(os.path.abspath(__file__))
+        self.skin_refine_ckpt           = os.path.join(_here, "..", "ckpt", "GFPGANv1.4.pth")
+        self.skin_refine_strength       = 0.6   # GFPGAN weight: 0=original, 1=fully restored
+        self.skin_refine_num_passes     = 2     # render→GFPGAN→bake iterations
+        self.skin_refine_blend_alpha    = 0.8   # UV blend with original texture
+        self.skin_refine_grain          = 0.018 # luminance grain std-dev (0=off)
+        self.skin_refine_resolution     = 512
+
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
         self.config = config if config is not None else Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
@@ -74,14 +85,20 @@ class Hunyuan3DPaintPipeline:
         logger.info("Loading AI Models...")
         torch.cuda.empty_cache()
         self.models["multiview_model"] = multiviewDiffusionNet(self.config)
+
+        if self.config.use_skin_refinement:
+            logger.info("Loading SkinTextureRefiner (GFPGAN) …")
+            self.models["skin_refiner"] = SkinTextureRefiner(
+                ckpt_path             = self.config.skin_refine_ckpt,
+                upscale               = 2,
+                restoration_strength  = self.config.skin_refine_strength,
+                num_passes            = self.config.skin_refine_num_passes,
+                blend_alpha           = self.config.skin_refine_blend_alpha,
+                grain_strength        = self.config.skin_refine_grain,
+                refine_resolution     = self.config.skin_refine_resolution,
+                device                = self.config.device,
+            )
         
-        logger.info("Loading SD1.5 refinement model...")
-        self.models["sd15_model"] = StableDiffusionImg2ImgPipeline.from_pretrained(
-            self.config.sd15_pretrained_path,
-            torch_dtype=torch.float16,
-        )
-        self.models["sd15_model"].to(self.config.device)
-        logger.info("SD1.5 model loaded.")
         logger.info("Models Loaded.")
 
     def refine_with_sd15(self, images, prompt="high quality, photorealistic, detailed texture"):
@@ -264,17 +281,8 @@ class Hunyuan3DPaintPipeline:
             )
             multiviews_pbr["albedo"], multiviews_pbr["mr"] = res["albedo"], res["mr"]
             
-            logger.info("Refining multiview albedo with SD1.5...")
-            refined_albedo = self.refine_with_sd15(
-                multiviews_pbr["albedo"],
-                prompt="high quality, photorealistic texture, detailed skin pores, realistic lighting"
-            )
-            multiviews_pbr["albedo"] = refined_albedo
-            
+            # SD1.5 refinement disabled
             alb_refined_dir = os.path.join(dbg_dir, "mv_albedo_refined")
-            os.makedirs(alb_refined_dir, exist_ok=True)
-            for i, im in enumerate(refined_albedo): im.save(os.path.join(alb_refined_dir, f"albedo_refined_{i:02d}.png"))
-            logger.info(f"Refined images saved to {alb_refined_dir}")
             
             os.makedirs(alb_raw_dir, exist_ok=True)
             os.makedirs(mr_raw_dir, exist_ok=True)
@@ -304,6 +312,27 @@ class Hunyuan3DPaintPipeline:
             texture_mr, _ = self.view_processor.bake_from_multiview(enhance_images["mr"], selected_camera_elevs, selected_camera_azims, selected_view_weights)
             texture_mr_final = self.view_processor.texture_inpaint(texture_mr, mask_np)
             self.render.set_texture_mr(texture_mr_final)
+
+        # 9) Skin texture refinement (GFPGAN face restoration)
+        if self.config.use_skin_refinement and "skin_refiner" in self.models:
+            # Free multiview model GPU memory before running GFPGAN
+            self.models["multiview_model"].pipeline.to("cpu")
+            torch.cuda.empty_cache()
+            logger.info("Running GFPGAN skin texture refinement …")
+
+            _debug = os.path.join(os.path.dirname(output_mesh_path), "skin_refiner_debug")
+            self.models["skin_refiner"](
+                render    = self.render,
+                debug_dir = _debug,
+            )
+
+        # Debug: save front-view renders before and after refinement for quick inspection
+        _snap_dir = os.path.join(os.path.dirname(output_mesh_path), "snapshots")
+        os.makedirs(_snap_dir, exist_ok=True)
+        for _elev, _azim, _tag in [(0, 0, "front"), (0, 90, "right"), (0, -90, "left"), (20, 0, "top")]:
+            _render_snap = self.render.render_normal(_elev, _azim, return_type="pl")
+            _render_snap.save(os.path.join(_snap_dir, f"normal_{_tag}.png"))
+        logger.info(f"Snapshots saved to {_snap_dir}")
 
         # Save outputs
         self.render.save_mesh(output_mesh_path, downsample=True)
