@@ -1,21 +1,33 @@
-"""skin_refine/refiner.py — GFPGAN Face Restoration Texture Refiner
-====================================================================
-Post-processing module for Hunyuan3D-2.1 paint pipeline.
+"""skin_refine/refiner.py — SkinTextureRefiner Orchestrator
+===========================================================
+Multi-view face restoration pipeline using pluggable refiners.
 
 Algorithm
 ---------
-1.  Forward-render the textured mesh from N viewpoints.
-2.  Apply GFPGAN face restoration to each rendered view:
-      – GFPGAN detects and aligns the face region.
-      – Restores skin detail, colour, and texture at high quality.
-      – Pastes the restored face back into the original render.
-3.  Back-project the enhanced views onto the UV texture using the
-    mesh's cosine-weighted baking (same as the original pipeline).
-4.  Blend: final_tex = blend_alpha × enhanced + (1-blend_alpha) × original
+1. Forward-render the textured mesh from N viewpoints.
+2. Apply a configurable face restorer to each rendered view.
+3. Back-project the enhanced views onto the UV texture.
+4. Blend: final_tex = blend_alpha × enhanced + (1-blend_alpha) × original
 
-Thesis contribution: applying pretrained face restoration (GFPGAN) in
-screen space and mapping the result back to UV via differentiable
-rendering, providing multi-view consistent skin enhancement.
+Usage
+-----
+    # Option 1: By name (auto-creates the refiner)
+    refiner = SkinTextureRefiner(refiner_name='codeformer')
+    
+    # Option 2: Direct instance
+    from skin_refine.refiners import CodeFormerRefiner
+    face_restorer = CodeFormerRefiner()
+    refiner = SkinTextureRefiner(refiner=face_restorer)
+    
+    # Option 3: Custom refiner
+    class MyRefiner(BaseSkinRefiner):
+        ...
+    refiner = SkinTextureRefiner(refiner=MyRefiner())
+    
+    # Run
+    refiner(render, debug_dir='debug')
+
+Available refiners: 'gfpgan', 'codeformer', 'none'
 """
 
 import os
@@ -24,21 +36,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from typing import Union, Optional
 
 from DifferentiableRenderer.camera_utils import get_mv_matrix, transform_pos
+from .base import BaseSkinRefiner
+from .registry import create_refiner, list_refiners
 
 logger = logging.getLogger(__name__)
 
-# Default GFPGAN checkpoint URL (downloaded on first use)
-_GFPGAN_CKPT_URL = (
-    "https://github.com/TencentARC/GFPGAN/releases/download/"
-    "v1.3.4/GFPGANv1.4.pth"
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Misc helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _save_img(arr, path):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -47,22 +52,6 @@ def _save_img(arr, path):
     arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
     Image.fromarray(arr).save(path)
 
-
-def _pil_to_cv2(pil_img):
-    """PIL RGB → cv2 BGR uint8."""
-    import cv2
-    return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
-
-
-def _cv2_to_pil(bgr):
-    """cv2 BGR uint8 → PIL RGB."""
-    import cv2
-    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Differentiable forward render
-# ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def _render_view(render, elev: float, azim: float, resolution: int = 512,
@@ -74,7 +63,6 @@ def _render_view(render, elev: float, azim: float, resolution: int = 512,
     rendered : (H, W, 3) float tensor [0, 1]
     visible  : (H, W, 1) float mask
     """
-    device = render.device
     r_mv = get_mv_matrix(elev=elev, azim=azim,
                          camera_distance=render.camera_distance)
     pos_cam  = transform_pos(r_mv, render.vtx_pos, keepdim=True)
@@ -85,137 +73,105 @@ def _render_view(render, elev: float, azim: float, resolution: int = 512,
                                           resolution=res)
 
     uv, _ = render.raster_interpolate(render.vtx_uv[None, ...], rast_out,
-                                      render.uv_idx)   # (1, H, W, 2) ∈ [0,1]
-    visible = (rast_out[0, ..., -1:] > 0).float()     # (H, W, 1)
+                                      render.uv_idx)
+    visible = (rast_out[0, ..., -1:] > 0).float()
 
-    tex  = getattr(render, tex_attr)                   # (H_t, W_t, 3)
-    tex4 = tex.permute(2, 0, 1).unsqueeze(0)           # (1, 3, H_t, W_t)
+    tex  = getattr(render, tex_attr)
+    tex4 = tex.permute(2, 0, 1).unsqueeze(0)
 
     grid     = uv * 2.0 - 1.0
     rendered = F.grid_sample(tex4, grid, align_corners=True,
                              mode="bilinear", padding_mode="border")
-    rendered = rendered.squeeze(0).permute(1, 2, 0) * visible  # (H, W, 3)
+    rendered = rendered.squeeze(0).permute(1, 2, 0) * visible
     return rendered, visible
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main class
-# ─────────────────────────────────────────────────────────────────────────────
-
 class SkinTextureRefiner:
-    """GFPGAN-based face restoration for baked UV textures.
+    """Multi-view face restoration orchestrator.
 
-    Enhances a baked UV texture by:
-      1. Rendering the mesh from multiple viewpoints.
-      2. Running GFPGAN face restoration on each rendered view.
-      3. Baking the restored views back to UV using cosine-weighted blending.
+    Accepts a pluggable refiner (any BaseSkinRefiner subclass) or a
+    refiner name string ('gfpgan', 'codeformer', 'none').
 
-    This is deterministic, stable, and produces photorealistic skin texture
-    without adversarial training instability.
+    Parameters
+    ----------
+    refiner : BaseSkinRefiner, optional
+        Pre-constructed refiner instance. If None, use refiner_name.
+    refiner_name : str, default='gfpgan'
+        Name of refiner to auto-create. Ignored if refiner is provided.
+    refiner_kwargs : dict, optional
+        Keyword arguments passed to create_refiner().
+    num_passes : int, default=2
+        Iterations of render→restore→bake.
+    blend_alpha : float, default=0.8
+        UV blend (0=original, 1=fully enhanced).
+    grain_strength : float, default=0.018
+        Std-dev of luminance grain added to final UV.
+    grain_seed : int, default=42
+        RNG seed for reproducibility.
+    refine_resolution : int, default=512
+        Resolution used when rendering views.
+    device : str, default='cuda'
+        Device for operations.
+    viewpoints : list of (elev, azim) tuples, optional
+        Camera positions for multi-view rendering.
     """
 
-    # (elev, azim) pairs — front-biased for face coverage
-    _VIEWPOINTS = [
-        (  0,   0),   # front
-        (  0,  30),   # slight right
-        (  0, -30),   # slight left
-        ( 15,   0),   # slightly elevated front
-        (-10,   0),   # slightly lowered front
-        (  0,  60),   # right
-        (  0, -60),   # left
-        ( 15,  30),   # elevated right
+    _DEFAULT_VIEWPOINTS = [
+        (  0,   0),
+        (  0,  30),
+        (  0, -30),
+        ( 15,   0),
+        (-10,   0),
+        (  0,  60),
+        (  0, -60),
+        ( 15,  30),
     ]
 
     def __init__(
         self,
-        ckpt_path: str      = None,
-        upscale: int        = 2,        # process at 2× → finer GFPGAN detail
-        arch: str           = "clean",
-        channel_multiplier: int = 2,
-        bg_upsampler         = None,
-        restoration_strength: float = 0.6,
-        num_passes: int      = 2,        # how many render→restore→bake iterations
-        blend_alpha: float   = 0.8,
-        grain_strength: float = 0.018,   # subtle luminance grain added to final UV
-        grain_seed: int      = 42,
+        refiner: Optional[BaseSkinRefiner] = None,
+        refiner_name: str = "gfpgan",
+        refiner_kwargs: Optional[dict] = None,
+        num_passes: int = 2,
+        blend_alpha: float = 0.8,
+        grain_strength: float = 0.018,
+        grain_seed: int = 42,
         refine_resolution: int = 512,
-        device: str          = "cuda",
+        device: str = "cuda",
+        viewpoints: Optional[list] = None,
     ):
-        """
-        ckpt_path            path to GFPGANv1.4.pth; auto-downloaded if None
-        upscale              internal GFPGAN upscale factor (2 = 1024px processing)
-        restoration_strength GFPGAN weight [0,1]: 0=original, 1=fully restored
-        num_passes           iterations of render→GFPGAN→bake (2 = refine twice)
-        blend_alpha          final UV blend (0=original, 1=fully enhanced)
-        grain_strength       std-dev of luminance grain added after enhancement
-        refine_resolution    resolution used when rendering views
-        """
-        self.restoration_strength = restoration_strength
-        self.num_passes            = num_passes
-        self.blend_alpha           = blend_alpha
-        self.grain_strength        = grain_strength
-        self.grain_seed            = grain_seed
-        self.refine_resolution     = refine_resolution
-        self.device                = device
+        if refiner is None:
+            logger.info(f"[SkinRefiner] Creating refiner: {refiner_name}")
+            kwargs = refiner_kwargs or {}
+            self.refiner = create_refiner(refiner_name, **kwargs)
+        else:
+            self.refiner = refiner
 
-        # Resolve checkpoint path
-        if ckpt_path is None:
-            _here = os.path.dirname(os.path.abspath(__file__))
-            ckpt_path = os.path.join(_here, "..", "..", "ckpt", "GFPGANv1.4.pth")
+        self.num_passes = num_passes
+        self.blend_alpha = blend_alpha
+        self.grain_strength = grain_strength
+        self.grain_seed = grain_seed
+        self.refine_resolution = refine_resolution
+        self.device = device
+        self.viewpoints = viewpoints or self._DEFAULT_VIEWPOINTS
 
-        if not os.path.isfile(ckpt_path):
-            logger.info(f"[SkinRefiner] Downloading GFPGAN checkpoint → {ckpt_path}")
-            import urllib.request
-            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            urllib.request.urlretrieve(_GFPGAN_CKPT_URL, ckpt_path)
+        logger.info(f"[SkinRefiner] Using refiner: {self.refiner.name}")
 
-        logger.info(f"[SkinRefiner] Loading GFPGAN from {ckpt_path} …")
-        from gfpgan import GFPGANer
-        self.restorer = GFPGANer(
-            model_path=ckpt_path,
-            upscale=upscale,
-            arch=arch,
-            channel_multiplier=channel_multiplier,
-            bg_upsampler=bg_upsampler,
-        )
-        logger.info("[SkinRefiner] GFPGAN ready.")
-
-    # ------------------------------------------------------------------
-    def _restore_view(self, rendered_hwc: torch.Tensor) -> np.ndarray:
-        """Apply GFPGAN to one rendered view.
-
-        Parameters
-        ----------
-        rendered_hwc : (H, W, 3) float tensor [0, 1]
-
-        Returns
-        -------
-        restored_rgb : (H, W, 3) uint8 numpy array, or None if no face found
-        """
-        import cv2
-        np_rgb   = (rendered_hwc.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        bgr_in   = cv2.cvtColor(np_rgb, cv2.COLOR_RGB2BGR)
-
-        _, _, bgr_out = self.restorer.enhance(
-            bgr_in,
-            has_aligned=False,
-            only_center_face=False,
-            paste_back=True,
-            weight=self.restoration_strength,
-        )
-
-        if bgr_out is None:
+    def _restore_view(self, rendered_hwc: torch.Tensor) -> Optional[np.ndarray]:
+        """Apply the plugged-in refiner to one rendered view."""
+        pil_img = self.refiner._tensor_to_pil(rendered_hwc)
+        restored = self.refiner.restore(pil_img)
+        if restored is None:
             return None
-        return cv2.cvtColor(bgr_out, cv2.COLOR_BGR2RGB)
+        return self.refiner._pil_to_array(restored)
 
-    # ------------------------------------------------------------------
     def _run_one_pass(self, render, res, has_mr, debug_dir=None, pass_idx=0):
-        """One render → GFPGAN → bake pass. Returns (new_tex, valid_mask, new_tex_mr, valid_mask_mr)."""
+        """One render → restore → bake pass."""
         textures_enh, cos_maps_enh = [], []
         textures_mr,  cos_maps_mr  = [], []
         n_restored = 0
 
-        for elev, azim in self._VIEWPOINTS:
+        for elev, azim in self.viewpoints:
             tag = f"az{azim:+04d}_el{elev:+03d}"
             rendered, _ = _render_view(render, elev, azim, res, "tex")
 
@@ -228,7 +184,7 @@ class SkinTextureRefiner:
                 continue
 
             n_restored += 1
-            enh_pil = Image.fromarray(restored_rgb)
+            enh_pil = Image.fromarray((restored_rgb * 255).clip(0, 255).astype(np.uint8))
 
             if debug_dir and pass_idx == self.num_passes - 1:
                 enh_pil.save(os.path.join(debug_dir, f"view_after_{tag}.png"))
@@ -246,7 +202,7 @@ class SkinTextureRefiner:
                 cos_maps_mr.append(cos_mr_bp)
 
         logger.info(f"[SkinRefiner] Pass {pass_idx+1}/{self.num_passes}: "
-                    f"restored {n_restored}/{len(self._VIEWPOINTS)} views.")
+                    f"restored {n_restored}/{len(self.viewpoints)} views.")
 
         if n_restored == 0:
             return None, None, None, None
@@ -258,7 +214,6 @@ class SkinTextureRefiner:
         )
         return new_tex, valid_mask, new_tex_mr, valid_mask_mr
 
-    # ------------------------------------------------------------------
     def _to_float_tex(self, t, ref_device):
         if t is None:
             return None
@@ -273,20 +228,19 @@ class SkinTextureRefiner:
             mask = mask.unsqueeze(-1)
         return (α * new_tex * mask + orig_tex * (1 - α * mask)).clamp(0, 1)
 
-    # ------------------------------------------------------------------
     def __call__(self, render, reference_images=None, debug_dir=None):
         """Enhance the texture currently loaded on *render* in-place.
 
         Parameters
         ----------
-        render            : MeshRender with .tex (and optionally .tex_mr) set
-        reference_images  : unused (kept for API compatibility)
-        debug_dir         : optional path; saves before/after renders if given
+        render : MeshRender
+            MeshRender with .tex (and optionally .tex_mr) set.
+        reference_images : list of PIL Images, optional
+            Reference images (passed to refiner; most refiners ignore this).
+        debug_dir : str, optional
+            Path to save before/after debug images.
         """
         res    = self.refine_resolution
-        device = self.device
-
-        # ── 0. Save original ─────────────────────────────────────────────
         orig_tex    = render.tex.clone()
         has_mr      = hasattr(render, "tex_mr") and render.tex_mr is not None
         orig_tex_mr = render.tex_mr.clone() if has_mr else None
@@ -296,7 +250,6 @@ class SkinTextureRefiner:
             _save_img(orig_tex.cpu().numpy(),
                       os.path.join(debug_dir, "texture_input.png"))
 
-        # ── 1. Multi-pass GFPGAN enhancement ─────────────────────────────
         for pass_idx in range(self.num_passes):
             new_tex, valid_mask, new_tex_mr, valid_mask_mr = self._run_one_pass(
                 render, res, has_mr, debug_dir, pass_idx)
@@ -315,24 +268,19 @@ class SkinTextureRefiner:
 
             render.set_texture(final_tex, force_set=True)
 
-        # ── 2. Add skin grain to final UV ─────────────────────────────────
         if self.grain_strength > 0:
             tex_final = render.tex.clone()
             gen = torch.Generator(device=tex_final.device)
             gen.manual_seed(self.grain_seed)
-            # Luminance-weighted noise: looks like fine skin texture variation
             noise = torch.randn(tex_final.shape, device=tex_final.device, generator=gen)
-            # Convert to luminance to apply grain only in luma channel
             luma_weights = torch.tensor([0.299, 0.587, 0.114],
                                         device=tex_final.device).view(1, 1, 3)
-            luma = (tex_final * luma_weights).sum(-1, keepdim=True)   # (H, W, 1)
-            # Scale noise by local luminance so highlights/shadows aren't over-grained
+            luma = (tex_final * luma_weights).sum(-1, keepdim=True)
             noise_scaled = noise * (luma * 0.5 + 0.5) * self.grain_strength
             grained_tex = (tex_final + noise_scaled).clamp(0, 1)
             render.set_texture(grained_tex, force_set=True)
             logger.info(f"[SkinRefiner] Grain applied (σ={self.grain_strength}).")
 
-        # ── 3. Debug saves ────────────────────────────────────────────────
         if debug_dir:
             final_tex = render.tex
             _save_img(final_tex.cpu().numpy(),
