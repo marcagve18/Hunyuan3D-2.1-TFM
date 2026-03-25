@@ -62,7 +62,7 @@ class SDRefinerRefiner(BaseSkinRefiner):
         negative_prompt: Optional[str] = None,
         strength: float = 0.12,
         guidance_scale: float = 5.0,
-        num_inference_steps: int = 50,
+        num_inference_steps: int = 25,
         seed: int = 42,
         upscale_to: int = 1024,
         device: str = "cuda",
@@ -72,9 +72,7 @@ class SDRefinerRefiner(BaseSkinRefiner):
         self.controlnet_path = controlnet_path
         self.prompt = prompt
         self.negative_prompt = negative_prompt or (
-            "teeth, tooth, open mouth, longbody, lowres, bad anatomy, "
-            "bad hands, missing fingers, extra digit, fewer digits, "
-            "cropped, worst quality, low quality, mutant"
+            "(deformed iris, deformed pupils, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime:1.4), text, close up, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck"
         )
         self.strength = strength
         self.guidance_scale = guidance_scale
@@ -108,7 +106,7 @@ class SDRefinerRefiner(BaseSkinRefiner):
             self.vae_path, torch_dtype=torch.float16
         )
 
-        logger.info("[SDRefiner] Loading SD 1.5 refinement model…")
+        logger.info(f"[SDRefiner] Loading SD 1.5 refinement model with checkpoint {self.pretrained_path}")
         self._pipeline = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             self.pretrained_path,
             vae=self._vae,
@@ -143,6 +141,10 @@ class SDRefinerRefiner(BaseSkinRefiner):
 
             generator = torch.Generator(device=self._device).manual_seed(self.seed)
 
+            logger.info(f"[SDRefiner] Refining with prompt={self.prompt!r}, "
+                        f"negative_prompt={self.negative_prompt!r}, "
+                        f"strength={self.strength}, guidance_scale={self.guidance_scale}, "
+                        f"num_inference_steps={self.num_inference_steps}, seed={self.seed}")
             refined = self._pipeline(
                 prompt=self.prompt,
                 image=img_upscaled,

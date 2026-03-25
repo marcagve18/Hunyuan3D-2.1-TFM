@@ -64,7 +64,7 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_ckpt_codeformer = os.path.join(_here, "..", "ckpt", "CodeFormer.pth")
         self.skin_refine_fidelity       = 0.5   # CodeFormer fidelity weight (0=quality, 1=fidelity)
         self.skin_refine_sd_prompt      = "Portrait of a white baby smiling"
-        self.skin_refine_sd_strength   = 0.12  # SD img2img strength
+        self.skin_refine_sd_strength   = 0.2  # SD img2img strength
 
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
