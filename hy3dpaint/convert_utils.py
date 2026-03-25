@@ -69,19 +69,15 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
         encoded = base64.b64encode(image_data).decode()
         return f"data:image/png;base64,{encoded}"
 
-    # 5. 合并metallic和roughness
-    if "metallic" in textures_dict and "roughness" in textures_dict:
-        mr_combined_path = "mr_combined.png"
-        combine_metallic_roughness(textures_dict["metallic"], textures_dict["roughness"], mr_combined_path)
-        textures_dict["metallicRoughness"] = mr_combined_path
+    # 5. Skip MR texture — use flat PBR factors for skin (dielectric, matte).
+    # The diffusion model's MR maps produce unrealistic metallic/roughness for skin.
 
-    # 6. 添加图像到GLTF
+    # 6. 添加图像到GLTF (albedo only, skip MR)
     images = []
     textures = []
 
     texture_mapping = {
         "albedo": "baseColorTexture",
-        "metallicRoughness": "metallicRoughnessTexture",
         "normal": "normalTexture",
         "ao": "occlusionTexture",
     }
@@ -96,19 +92,15 @@ def create_glb_with_pbr_materials(obj_path, textures_dict, output_path):
             texture = pygltflib.Texture(source=len(images) - 1)
             textures.append(texture)
 
-    # 7. 创建PBR材质
+    # 7. 创建PBR材质 — flat factors for skin: no metallic, matte roughness
     pbr_metallic_roughness = pygltflib.PbrMetallicRoughness(
-        baseColorFactor=[1.0, 1.0, 1.0, 1.0], metallicFactor=1.0, roughnessFactor=1.0
+        baseColorFactor=[1.0, 1.0, 1.0, 1.0], metallicFactor=0.0, roughnessFactor=0.7
     )
 
-    # 设置纹理索引
+    # 设置纹理索引 (albedo only)
     texture_index = 0
     if "albedo" in textures_dict:
         pbr_metallic_roughness.baseColorTexture = pygltflib.TextureInfo(index=texture_index)
-        texture_index += 1
-
-    if "metallicRoughness" in textures_dict:
-        pbr_metallic_roughness.metallicRoughnessTexture = pygltflib.TextureInfo(index=texture_index)
         texture_index += 1
 
     # 创建材质

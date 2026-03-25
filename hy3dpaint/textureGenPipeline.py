@@ -292,6 +292,14 @@ class Hunyuan3DPaintPipeline:
             texture_mr_final = self.view_processor.texture_inpaint(texture_mr, mask_np)
             self.render.set_texture_mr(texture_mr_final)
 
+        # Clamp MR values for realistic skin: metallic ≈ 0, roughness ∈ [0.5, 0.8]
+        if hasattr(self.render, "tex_mr"):
+            mr = self.render.tex_mr
+            mr[:, :, 0] = mr[:, :, 0].clamp(0.0, 0.03)   # metallic → near zero (skin is dielectric)
+            mr[:, :, 1] = mr[:, :, 1].clamp(0.5, 0.8)     # roughness → matte skin range
+            self.render.tex_mr = mr
+            logger.info("MR texture clamped for skin: metallic≤0.03, roughness∈[0.5,0.8]")
+
         # 9) Skin texture refinement (if skin_refiner param was provided)
         if "skin_refiner" in self.models:
             if "multiview_model" in self.models:
