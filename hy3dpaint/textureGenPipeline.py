@@ -66,6 +66,25 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_sd_prompt      = "Portrait of a white baby smiling"
         self.skin_refine_sd_strength   = 0.2  # SD img2img strength
 
+        # ScreenFreq settings (screen-space Laplacian back-projection, SD 1.5 backend)
+        self.skin_refine_screenfreq_num_levels       = 4
+        self.skin_refine_screenfreq_freq_split       = 2
+        self.skin_refine_screenfreq_render_resolution = 896
+        self.skin_refine_screenfreq_strength         = 0.5
+        self.skin_refine_screenfreq_controlnet_scale = 1.0
+        self.skin_refine_screenfreq_prompt           = "photorealistic baby face, natural skin pores, subsurface scattering, detailed skin texture"
+        self.skin_refine_screenfreq_band_weights     = [0.8, 0.7]
+
+        # FreqSkin settings (frequency-decomposed UV-space refinement, SD 1.5 backend)
+        self.skin_refine_freqskin_num_levels       = 4
+        self.skin_refine_freqskin_freq_split       = 2
+        self.skin_refine_freqskin_tile_size        = 512   # SD 1.5 native resolution
+        self.skin_refine_freqskin_tile_overlap     = 128
+        self.skin_refine_freqskin_strength         = 0.40
+        self.skin_refine_freqskin_controlnet_scale = 1.0
+        self.skin_refine_freqskin_prompt           = "extreme close-up of baby skin, photorealistic skin pores, subsurface scattering, natural skin texture, 8k texture map"
+        self.skin_refine_freqskin_band_weights     = [0.8, 0.7]
+
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
         self.config = config if config is not None else Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
@@ -146,6 +165,29 @@ class Hunyuan3DPaintPipeline:
                 refiner_kwargs = {
                     "prompt": self.config.skin_refine_sd_prompt,
                     "strength": self.config.skin_refine_sd_strength,
+                    "device": self.config.device,
+                }
+            elif rtype == "screen_freq":
+                refiner_kwargs = {
+                    "num_levels": self.config.skin_refine_screenfreq_num_levels,
+                    "freq_split": self.config.skin_refine_screenfreq_freq_split,
+                    "render_resolution": self.config.skin_refine_screenfreq_render_resolution,
+                    "strength": self.config.skin_refine_screenfreq_strength,
+                    "controlnet_scale": self.config.skin_refine_screenfreq_controlnet_scale,
+                    "prompt": self.config.skin_refine_screenfreq_prompt,
+                    "band_weights": self.config.skin_refine_screenfreq_band_weights,
+                    "device": self.config.device,
+                }
+            elif rtype == "freqskin":
+                refiner_kwargs = {
+                    "num_levels": self.config.skin_refine_freqskin_num_levels,
+                    "freq_split": self.config.skin_refine_freqskin_freq_split,
+                    "tile_size": self.config.skin_refine_freqskin_tile_size,
+                    "tile_overlap": self.config.skin_refine_freqskin_tile_overlap,
+                    "strength": self.config.skin_refine_freqskin_strength,
+                    "controlnet_scale": self.config.skin_refine_freqskin_controlnet_scale,
+                    "prompt": self.config.skin_refine_freqskin_prompt,
+                    "band_weights": self.config.skin_refine_freqskin_band_weights,
                     "device": self.config.device,
                 }
             refiner = create_refiner(rtype, **refiner_kwargs)

@@ -228,6 +228,82 @@ class SkinTextureRefiner:
             mask = mask.unsqueeze(-1)
         return (α * new_tex * mask + orig_tex * (1 - α * mask)).clamp(0, 1)
 
+    def _has_screen_freq_mode(self) -> bool:
+        """Check if the refiner supports screen-space Laplacian back-projection."""
+        return hasattr(self.refiner, "refine_screen_freq") and callable(self.refiner.refine_screen_freq)
+
+    def _run_screen_freq_mode(self, render, debug_dir=None):
+        """Screen-space Laplacian back-projection: delegate fully to the refiner."""
+        logger.info("[SkinRefiner] Using screen-freq mode (screen-space Laplacian back-projection).")
+        orig_tex = render.tex.clone()
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            _save_img(orig_tex.cpu().numpy(),
+                      os.path.join(debug_dir, "texture_input.png"))
+
+        self.refiner.refine_screen_freq(render, debug_dir=debug_dir)
+
+        if self.grain_strength > 0:
+            self._apply_grain(render)
+
+        logger.info("[SkinRefiner] Screen-freq enhancement complete.")
+
+    def _has_uv_mode(self) -> bool:
+        """Check if the refiner supports direct UV-space processing."""
+        return hasattr(self.refiner, "refine_uv") and callable(self.refiner.refine_uv)
+
+    def _run_uv_mode(self, render, debug_dir=None):
+        """UV-space refinement: call refiner.refine_uv() directly on the texture."""
+        logger.info("[SkinRefiner] Using UV-space mode (bypassing render→bake loop).")
+        orig_tex = render.tex.clone()
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            _save_img(orig_tex.cpu().numpy(),
+                      os.path.join(debug_dir, "texture_input.png"))
+
+        refined = self.refiner.refine_uv(
+            texture=render.tex,
+            mask=None,
+            debug_dir=debug_dir,
+        )
+        render.set_texture(refined, force_set=True)
+
+        # Apply grain
+        if self.grain_strength > 0:
+            self._apply_grain(render)
+
+        if debug_dir:
+            self._save_comparison(orig_tex, render.tex, debug_dir)
+
+        logger.info("[SkinRefiner] UV-space enhancement complete.")
+
+    def _apply_grain(self, render):
+        """Add luminance-modulated grain to the current texture."""
+        tex_final = render.tex.clone()
+        gen = torch.Generator(device=tex_final.device)
+        gen.manual_seed(self.grain_seed)
+        noise = torch.randn(tex_final.shape, device=tex_final.device, generator=gen)
+        luma_weights = torch.tensor([0.299, 0.587, 0.114],
+                                    device=tex_final.device).view(1, 1, 3)
+        luma = (tex_final * luma_weights).sum(-1, keepdim=True)
+        noise_scaled = noise * (luma * 0.5 + 0.5) * self.grain_strength
+        grained_tex = (tex_final + noise_scaled).clamp(0, 1)
+        render.set_texture(grained_tex, force_set=True)
+        logger.info(f"[SkinRefiner] Grain applied (σ={self.grain_strength}).")
+
+    def _save_comparison(self, orig_tex, final_tex, debug_dir):
+        """Save before/after debug images."""
+        _save_img(final_tex.cpu().numpy(),
+                  os.path.join(debug_dir, "texture_output.png"))
+        before_np = np.clip(orig_tex.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        after_np  = np.clip(final_tex.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        sep = np.ones((before_np.shape[0], 4, 3), dtype=np.uint8) * 200
+        Image.fromarray(np.concatenate([before_np, sep, after_np], axis=1)).save(
+            os.path.join(debug_dir, "texture_comparison.png"))
+        logger.info(f"[SkinRefiner] Debug images → {debug_dir}")
+
     def __call__(self, render, reference_images=None, debug_dir=None):
         """Enhance the texture currently loaded on *render* in-place.
 
@@ -240,6 +316,15 @@ class SkinTextureRefiner:
         debug_dir : str, optional
             Path to save before/after debug images.
         """
+        # Screen-freq mode: highest priority (screen-space Laplacian back-projection)
+        if self._has_screen_freq_mode():
+            return self._run_screen_freq_mode(render, debug_dir)
+
+        # UV-space mode: bypass render→bake loop entirely
+        if self._has_uv_mode():
+            return self._run_uv_mode(render, debug_dir)
+
+        # Screen-space mode: multi-view render→restore→bake
         res    = self.refine_resolution
         orig_tex    = render.tex.clone()
         has_mr      = hasattr(render, "tex_mr") and render.tex_mr is not None
@@ -269,27 +354,9 @@ class SkinTextureRefiner:
             render.set_texture(final_tex, force_set=True)
 
         if self.grain_strength > 0:
-            tex_final = render.tex.clone()
-            gen = torch.Generator(device=tex_final.device)
-            gen.manual_seed(self.grain_seed)
-            noise = torch.randn(tex_final.shape, device=tex_final.device, generator=gen)
-            luma_weights = torch.tensor([0.299, 0.587, 0.114],
-                                        device=tex_final.device).view(1, 1, 3)
-            luma = (tex_final * luma_weights).sum(-1, keepdim=True)
-            noise_scaled = noise * (luma * 0.5 + 0.5) * self.grain_strength
-            grained_tex = (tex_final + noise_scaled).clamp(0, 1)
-            render.set_texture(grained_tex, force_set=True)
-            logger.info(f"[SkinRefiner] Grain applied (σ={self.grain_strength}).")
+            self._apply_grain(render)
 
         if debug_dir:
-            final_tex = render.tex
-            _save_img(final_tex.cpu().numpy(),
-                      os.path.join(debug_dir, "texture_output.png"))
-            before_np = np.clip(orig_tex.cpu().numpy() * 255, 0, 255).astype(np.uint8)
-            after_np  = np.clip(final_tex.cpu().numpy() * 255, 0, 255).astype(np.uint8)
-            sep = np.ones((before_np.shape[0], 4, 3), dtype=np.uint8) * 200
-            Image.fromarray(np.concatenate([before_np, sep, after_np], axis=1)).save(
-                os.path.join(debug_dir, "texture_comparison.png"))
-            logger.info(f"[SkinRefiner] Debug images → {debug_dir}")
+            self._save_comparison(orig_tex, render.tex, debug_dir)
 
         logger.info("[SkinRefiner] Enhancement complete.")
