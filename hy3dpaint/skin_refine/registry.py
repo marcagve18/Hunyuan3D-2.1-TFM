@@ -94,9 +94,11 @@ from .refiners.codeformer import CodeFormerRefiner
 from .refiners.sd import SDRefinerRefiner
 from .refiners.freqskin import FreqSkinRefiner
 from .refiners.screen_freq import ScreenFreqSkinRefiner
+from .refiners.nafnet import NAFNetRefiner
 
 register_refiner("gfpgan")(GFPGANRefiner)
 register_refiner("codeformer")(CodeFormerRefiner)
 register_refiner("sd")(SDRefinerRefiner)
 register_refiner("freqskin")(FreqSkinRefiner)
 register_refiner("screen_freq")(ScreenFreqSkinRefiner)
+register_refiner("nafnet")(NAFNetRefiner)

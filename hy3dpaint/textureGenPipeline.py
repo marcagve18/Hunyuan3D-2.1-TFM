@@ -85,6 +85,11 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_freqskin_prompt           = "extreme close-up of baby skin, photorealistic skin pores, subsurface scattering, natural skin texture, 8k texture map"
         self.skin_refine_freqskin_band_weights     = [0.8, 0.7]
 
+        # NAFNet settings
+        self.skin_refine_nafnet_ckpt      = os.path.join(_here, "..", "baby_upscaler", "runs", "phase2", "ckpt_best.pth")
+        self.skin_refine_nafnet_sidd_ckpt = os.path.join(_here, "..", "..", "baby_upscaler", "ckpts", "NAFNet-SIDD-width64.pth")
+        self.skin_refine_nafnet_root      = os.path.join(_here, "..", "..", "baby_upscaler")
+
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
         self.config = config if config is not None else Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
@@ -188,6 +193,14 @@ class Hunyuan3DPaintPipeline:
                     "controlnet_scale": self.config.skin_refine_freqskin_controlnet_scale,
                     "prompt": self.config.skin_refine_freqskin_prompt,
                     "band_weights": self.config.skin_refine_freqskin_band_weights,
+                    "device": self.config.device,
+                }
+            elif rtype == "nafnet":
+                nafnet_ckpt = self.config.skin_refine_nafnet_ckpt
+                refiner_kwargs = {
+                    "ckpt_path":  nafnet_ckpt if nafnet_ckpt and os.path.exists(nafnet_ckpt) else None,
+                    "sidd_ckpt":  self.config.skin_refine_nafnet_sidd_ckpt,
+                    "nafnet_root": self.config.skin_refine_nafnet_root,
                     "device": self.config.device,
                 }
             refiner = create_refiner(rtype, **refiner_kwargs)
