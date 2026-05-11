@@ -57,7 +57,7 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_ckpt           = os.path.join(_here, "..", "ckpt", "GFPGANv1.4.pth")
         self.skin_refine_strength       = 0.6   # GFPGAN weight: 0=original, 1=fully restored
         self.skin_refine_num_passes     = 2     # render→restore→bake iterations
-        self.skin_refine_blend_alpha    = 0.8   # UV blend with original texture
+        self.skin_refine_blend_alpha    = 1.0   # UV blend with original texture
         self.skin_refine_grain          = 0.018 # luminance grain std-dev (0=off)
         self.skin_refine_resolution     = 512
         self.skin_refine_type           = "codeformer"  # 'gfpgan', 'codeformer', 'sd', or 'none'
@@ -89,6 +89,58 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_nafnet_ckpt      = os.path.join(_here, "..", "baby_upscaler", "runs", "phase2", "ckpt_best.pth")
         self.skin_refine_nafnet_sidd_ckpt = os.path.join(_here, "..", "..", "baby_upscaler", "ckpts", "NAFNet-SIDD-width64.pth")
         self.skin_refine_nafnet_root      = os.path.join(_here, "..", "..", "baby_upscaler")
+
+        # Flux Kontext LoRA settings
+        self.skin_refine_flux_kontext_model      = "black-forest-labs/FLUX.1-Kontext-dev"
+        self.skin_refine_flux_kontext_lora_path  = os.path.join(
+            _here, "..", "..", "flux_kontext_lora", "outputs",
+            "flux_kontext_lora_controlnet",
+            "flux_kontext_lora_controlnet.safetensors",
+        )
+        self.skin_refine_flux_kontext_lora_scale   = 1.2
+        self.skin_refine_flux_kontext_prompt        = "make this person look real"
+        self.skin_refine_flux_kontext_guidance      = 2.5
+        self.skin_refine_flux_kontext_steps         = 30
+        self.skin_refine_flux_kontext_width         = 1024
+        self.skin_refine_flux_kontext_height        = 1024
+        self.skin_refine_flux_kontext_seed          = 42
+        self.skin_refine_flux_kontext_dtype         = "bfloat16"
+        self.skin_refine_flux_kontext_align         = True
+        self.skin_refine_flux_kontext_align_conf    = 0.9
+        self.skin_refine_flux_kontext_align_feather = 2
+        self.skin_refine_flux_kontext_num_passes    = 1   # Flux is heavy — 1 pass is enough
+
+        # UV texture resolution for refinement (bump from bake resolution before refiner runs)
+        # None = keep bake resolution (texture_size); set e.g. 8192 to upscale before refinement
+        self.skin_refine_texture_size = None
+
+        # Flux Klein tiled UV refiner
+        self.skin_refine_flux_klein_model      = "black-forest-labs/FLUX.2-klein-base-4B"
+        self.skin_refine_flux_klein_lora_path   = None
+        self.skin_refine_flux_klein_lora_scale  = 1
+        self.skin_refine_flux_klein_prompt      = "Generate a high-resolution detailed version of image1, strictly following the edge structure of the image."
+        self.skin_refine_flux_klein_guidance    = 1.8
+        self.skin_refine_flux_klein_steps       = 50
+        self.skin_refine_flux_klein_tile_size   = 1024
+        self.skin_refine_flux_klein_tile_overlap = 256
+        self.skin_refine_flux_klein_seed        = 42
+        self.skin_refine_flux_klein_dtype       = "bfloat16"
+
+        # FLUX.2-Klein multiview (screen-space, same render→bake loop as Kontext)
+        self.skin_refine_flux_klein_mv_model      = "black-forest-labs/FLUX.2-klein-base-4B"
+        self.skin_refine_flux_klein_mv_lora_path  = None
+        self.skin_refine_flux_klein_mv_lora_scale = 1.0
+        self.skin_refine_flux_klein_mv_prompt     = "Enhance sharpness and detail, preserve structure"
+        self.skin_refine_flux_klein_mv_guidance   = 1.4
+        self.skin_refine_flux_klein_mv_steps      = 40
+        self.skin_refine_flux_klein_mv_width      = 1024
+        self.skin_refine_flux_klein_mv_height     = 1024
+        self.skin_refine_flux_klein_mv_seed       = 42
+        self.skin_refine_flux_klein_mv_dtype      = "bfloat16"
+        self.skin_refine_flux_klein_mv_align      = False
+        self.skin_refine_flux_klein_mv_align_conf = 0.9
+        self.skin_refine_flux_klein_mv_align_feather = 2
+        self.skin_refine_flux_klein_mv_num_passes = 1
 
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
@@ -203,11 +255,65 @@ class Hunyuan3DPaintPipeline:
                     "nafnet_root": self.config.skin_refine_nafnet_root,
                     "device": self.config.device,
                 }
+            elif rtype == "flux_kontext":
+                refiner_kwargs = {
+                    "model":       self.config.skin_refine_flux_kontext_model,
+                    "lora_path":   self.config.skin_refine_flux_kontext_lora_path,
+                    "lora_scale":  self.config.skin_refine_flux_kontext_lora_scale,
+                    "prompt":      self.config.skin_refine_flux_kontext_prompt,
+                    "guidance_scale": self.config.skin_refine_flux_kontext_guidance,
+                    "num_inference_steps": self.config.skin_refine_flux_kontext_steps,
+                    "width":       self.config.skin_refine_flux_kontext_width,
+                    "height":      self.config.skin_refine_flux_kontext_height,
+                    "seed":        self.config.skin_refine_flux_kontext_seed,
+                    "dtype":          self.config.skin_refine_flux_kontext_dtype,
+                    "device":         self.config.device,
+                    "align":          self.config.skin_refine_flux_kontext_align,
+                    "align_conf":     self.config.skin_refine_flux_kontext_align_conf,
+                    "align_feather":  self.config.skin_refine_flux_kontext_align_feather,
+                }
+            elif rtype == "flux_klein":
+                refiner_kwargs = {
+                    "model":       self.config.skin_refine_flux_klein_model,
+                    "lora_path":   self.config.skin_refine_flux_klein_lora_path,
+                    "lora_scale":  self.config.skin_refine_flux_klein_lora_scale,
+                    "prompt":      self.config.skin_refine_flux_klein_prompt,
+                    "guidance_scale": self.config.skin_refine_flux_klein_guidance,
+                    "num_inference_steps": self.config.skin_refine_flux_klein_steps,
+                    "tile_size":   self.config.skin_refine_flux_klein_tile_size,
+                    "tile_overlap": self.config.skin_refine_flux_klein_tile_overlap,
+                    "seed":        self.config.skin_refine_flux_klein_seed,
+                    "dtype":       self.config.skin_refine_flux_klein_dtype,
+                    "device":      self.config.device,
+                }
+            elif rtype == "flux_klein_multiview":
+                refiner_kwargs = {
+                    "model":       self.config.skin_refine_flux_klein_mv_model,
+                    "lora_path":   self.config.skin_refine_flux_klein_mv_lora_path,
+                    "lora_scale":  self.config.skin_refine_flux_klein_mv_lora_scale,
+                    "prompt":      self.config.skin_refine_flux_klein_mv_prompt,
+                    "guidance_scale": self.config.skin_refine_flux_klein_mv_guidance,
+                    "num_inference_steps": self.config.skin_refine_flux_klein_mv_steps,
+                    "width":       self.config.skin_refine_flux_klein_mv_width,
+                    "height":      self.config.skin_refine_flux_klein_mv_height,
+                    "seed":        self.config.skin_refine_flux_klein_mv_seed,
+                    "dtype":       self.config.skin_refine_flux_klein_mv_dtype,
+                    "device":      self.config.device,
+                    "align":       self.config.skin_refine_flux_klein_mv_align,
+                    "align_conf":  self.config.skin_refine_flux_klein_mv_align_conf,
+                    "align_feather": self.config.skin_refine_flux_klein_mv_align_feather,
+                }
             refiner = create_refiner(rtype, **refiner_kwargs)
         
+        if rtype == "flux_kontext":
+            num_passes = self.config.skin_refine_flux_kontext_num_passes
+        elif rtype == "flux_klein_multiview":
+            num_passes = self.config.skin_refine_flux_klein_mv_num_passes
+        else:
+            num_passes = self.config.skin_refine_num_passes
         self.models["skin_refiner"] = SkinTextureRefiner(
             refiner=refiner,
-            num_passes=self.config.skin_refine_num_passes,
+            num_passes=num_passes,
             blend_alpha=self.config.skin_refine_blend_alpha,
             grain_strength=self.config.skin_refine_grain,
             refine_resolution=self.config.skin_refine_resolution,
@@ -360,7 +466,24 @@ class Hunyuan3DPaintPipeline:
             if "multiview_model" in self.models:
                 self.models["multiview_model"].pipeline.to("cpu")
             torch.cuda.empty_cache()
-            
+
+            # Optionally bump UV texture resolution before refinement so the
+            # refiner's render→restore→bake loop operates at higher resolution.
+            _refine_tex_size = self.config.skin_refine_texture_size
+            if _refine_tex_size is not None:
+                import torch.nn.functional as F
+                old_h, old_w = self.render.texture_size
+                new_size = (_refine_tex_size, _refine_tex_size) if isinstance(_refine_tex_size, int) else _refine_tex_size
+                if (new_size[0] > old_h or new_size[1] > old_w):
+                    logger.info(f"Upscaling UV texture from {old_h}×{old_w} → {new_size[0]}×{new_size[1]} before refinement")
+                    self.render.set_default_texture_resolution(new_size)
+                    for attr in ("tex", "tex_mr", "tex_normalMap"):
+                        t = getattr(self.render, attr, None)
+                        if t is not None and t.numel() > 0:
+                            t_chw = t.permute(2, 0, 1).unsqueeze(0)
+                            t_up = F.interpolate(t_chw, size=new_size, mode="bicubic", align_corners=False)
+                            setattr(self.render, attr, t_up.squeeze(0).permute(1, 2, 0).clamp(0, 1))
+
             refiner_name = self.models["skin_refiner"].refiner.name
             logger.info(f"Running {refiner_name} skin texture refinement …")
 

@@ -1,7 +1,7 @@
 from .refiner import SkinTextureRefiner
 from .base import BaseSkinRefiner
 from .registry import create_refiner, list_refiners, register_refiner
-from .refiners import GFPGANRefiner, CodeFormerRefiner, FreqSkinRefiner, NAFNetRefiner
+from .refiners import GFPGANRefiner, CodeFormerRefiner, FreqSkinRefiner, NAFNetRefiner, FluxKontextRefiner
 
 __all__ = [
     "SkinTextureRefiner",
@@ -13,4 +13,5 @@ __all__ = [
     "CodeFormerRefiner",
     "FreqSkinRefiner",
     "NAFNetRefiner",
+    "FluxKontextRefiner",
 ]

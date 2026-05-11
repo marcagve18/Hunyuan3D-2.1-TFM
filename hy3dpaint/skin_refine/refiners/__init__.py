@@ -6,5 +6,8 @@ from .sd import SDRefinerRefiner
 from .freqskin import FreqSkinRefiner
 from .screen_freq import ScreenFreqSkinRefiner
 from .nafnet import NAFNetRefiner
+from .flux_kontext import FluxKontextRefiner
+from .flux_klein import FluxKleinTiledRefiner
+from .flux_klein_multiview import FluxKleinMultiviewRefiner
 
-__all__ = ["GFPGANRefiner", "CodeFormerRefiner", "SDRefinerRefiner", "FreqSkinRefiner", "ScreenFreqSkinRefiner", "NAFNetRefiner"]
+__all__ = ["GFPGANRefiner", "CodeFormerRefiner", "SDRefinerRefiner", "FreqSkinRefiner", "ScreenFreqSkinRefiner", "NAFNetRefiner", "FluxKontextRefiner", "FluxKleinTiledRefiner", "FluxKleinMultiviewRefiner"]

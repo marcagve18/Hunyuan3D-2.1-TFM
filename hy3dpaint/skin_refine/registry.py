@@ -95,6 +95,9 @@ from .refiners.sd import SDRefinerRefiner
 from .refiners.freqskin import FreqSkinRefiner
 from .refiners.screen_freq import ScreenFreqSkinRefiner
 from .refiners.nafnet import NAFNetRefiner
+from .refiners.flux_kontext import FluxKontextRefiner
+from .refiners.flux_klein import FluxKleinTiledRefiner
+from .refiners.flux_klein_multiview import FluxKleinMultiviewRefiner
 
 register_refiner("gfpgan")(GFPGANRefiner)
 register_refiner("codeformer")(CodeFormerRefiner)
@@ -102,3 +105,6 @@ register_refiner("sd")(SDRefinerRefiner)
 register_refiner("freqskin")(FreqSkinRefiner)
 register_refiner("screen_freq")(ScreenFreqSkinRefiner)
 register_refiner("nafnet")(NAFNetRefiner)
+register_refiner("flux_kontext")(FluxKontextRefiner)
+register_refiner("flux_klein")(FluxKleinTiledRefiner)
+register_refiner("flux_klein_multiview")(FluxKleinMultiviewRefiner)
