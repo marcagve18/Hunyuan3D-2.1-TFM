@@ -74,6 +74,7 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
         align: bool = True,
         align_conf: float = 0.9,
         align_feather: int = 2,
+        use_normals: bool = False,
     ):
         self.model_id = model
         self.lora_path = lora_path
@@ -89,8 +90,12 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
         self.align = align
         self.align_conf = align_conf
         self.align_feather = align_feather
+        self.use_normals = use_normals
         self._pipeline = None
         self._loftr = None
+        self.debug_dir = None
+        self._view_counter = 0
+        self._current_normal = None
 
     @property
     def name(self) -> str:
@@ -146,7 +151,7 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
         return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
     def _correct_geometry(
-        self, original: Image.Image, refined: Image.Image
+        self, original: Image.Image, refined: Image.Image, dbg_prefix: str = None
     ) -> Image.Image:
         self._load_loftr()
 
@@ -163,6 +168,28 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
         good = conf > self.align_conf
         kpts0, kpts1 = kpts0[good], kpts1[good]
         logger.info(f"[FluxKleinMV] LoFTR matches (conf>{self.align_conf}): {len(kpts0)}")
+
+        if dbg_prefix and len(kpts0) > 0:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(1, 2, figsize=(20, 10))
+            ax[0].imshow(np.array(original)); ax[0].set_title("Original")
+            ax[1].imshow(np.array(refined)); ax[1].set_title("Klein output")
+            for p0, p1 in zip(kpts0, kpts1):
+                ax[0].plot(p0[0], p0[1], 'r.', markersize=3)
+                ax[1].plot(p1[0], p1[1], 'g.', markersize=3)
+            for a in ax: a.axis("off")
+            fig.savefig(f"{dbg_prefix}_keypoints.png", bbox_inches="tight", dpi=150)
+            plt.close(fig)
+
+            fig2, ax2 = plt.subplots(1, 1, figsize=(10, 10))
+            ax2.imshow(np.array(original))
+            for p0, p1 in zip(kpts0, kpts1):
+                ax2.annotate("", xy=p1, xytext=p0,
+                             arrowprops=dict(arrowstyle="->", color="red", lw=0.5))
+            ax2.set_title(f"Displacement vectors ({len(kpts0)} matches)")
+            ax2.axis("off")
+            fig2.savefig(f"{dbg_prefix}_displacements.png", bbox_inches="tight", dpi=150)
+            plt.close(fig2)
 
         inp_bgr = self._pil_to_bgr(original)
         ref_bgr = self._pil_to_bgr(refined)
@@ -218,6 +245,12 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
             weight = face_mask.astype(np.float32) / 255.0
 
         out_bgr = (warped_bgr.astype(np.float32) * weight[:, :, None]).clip(0, 255).astype(np.uint8)
+
+        if dbg_prefix:
+            self._bgr_to_pil(warped_bgr).save(f"{dbg_prefix}_warped.png")
+            Image.fromarray(face_mask).save(f"{dbg_prefix}_face_mask.png")
+            self._bgr_to_pil(out_bgr).save(f"{dbg_prefix}_aligned_final.png")
+
         return self._bgr_to_pil(out_bgr)
 
     # ------------------------------------------------------------------
@@ -242,9 +275,24 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
                 f"guidance={self.guidance_scale}"
             )
 
+            dbg_prefix = None
+            if self.debug_dir:
+                import os
+                os.makedirs(self.debug_dir, exist_ok=True)
+                dbg_prefix = os.path.join(self.debug_dir, f"view_{self._view_counter:02d}")
+                image.save(f"{dbg_prefix}_input.png")
+
+            klein_images = [img_resized]
+            if self.use_normals and self._current_normal is not None:
+                normal_resized = self._current_normal.convert("RGB").resize((w16, h16), Image.LANCZOS)
+                klein_images.append(normal_resized)
+                if dbg_prefix:
+                    normal_resized.save(f"{dbg_prefix}_normal.png")
+                logger.info("[FluxKleinMV] Passing normal map as additional reference image")
+
             result = self._pipeline(
                 prompt=self.prompt,
-                image=img_resized,
+                image=klein_images,
                 height=h16,
                 width=w16,
                 guidance_scale=self.guidance_scale,
@@ -254,9 +302,16 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
 
             result = result.resize(original_size, Image.LANCZOS)
 
-            if self.align:
-                result = self._correct_geometry(image, result)
+            if dbg_prefix:
+                result.save(f"{dbg_prefix}_klein_output.png")
 
+            if self.align:
+                result = self._correct_geometry(image, result, dbg_prefix)
+
+            if dbg_prefix:
+                result.save(f"{dbg_prefix}_final.png")
+
+            self._view_counter += 1
             return result
 
         except Exception as e:

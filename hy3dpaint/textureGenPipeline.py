@@ -105,7 +105,7 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_flux_kontext_height        = 1024
         self.skin_refine_flux_kontext_seed          = 42
         self.skin_refine_flux_kontext_dtype         = "bfloat16"
-        self.skin_refine_flux_kontext_align         = True
+        self.skin_refine_flux_kontext_align         = False
         self.skin_refine_flux_kontext_align_conf    = 0.9
         self.skin_refine_flux_kontext_align_feather = 2
         self.skin_refine_flux_kontext_num_passes    = 1   # Flux is heavy — 1 pass is enough
@@ -130,7 +130,7 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_flux_klein_mv_model      = "black-forest-labs/FLUX.2-klein-base-4B"
         self.skin_refine_flux_klein_mv_lora_path  = None
         self.skin_refine_flux_klein_mv_lora_scale = 1.0
-        self.skin_refine_flux_klein_mv_prompt     = "Enhance sharpness and detail, preserve structure"
+        self.skin_refine_flux_klein_mv_prompt     = "Enhance sharpness and detail, preserve structure. Realistic baby skin texture."
         self.skin_refine_flux_klein_mv_guidance   = 1.4
         self.skin_refine_flux_klein_mv_steps      = 40
         self.skin_refine_flux_klein_mv_width      = 1024
@@ -141,6 +141,24 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_flux_klein_mv_align_conf = 0.9
         self.skin_refine_flux_klein_mv_align_feather = 2
         self.skin_refine_flux_klein_mv_num_passes = 1
+        self.skin_refine_flux_klein_mv_use_normals = True
+
+        # FLUX.2-Klein synchronized multiview (SyncDiffusion-style latent blending)
+        self.skin_refine_flux_klein_sync_model      = "black-forest-labs/FLUX.2-klein-base-4B"
+        self.skin_refine_flux_klein_sync_lora_path   = None
+        self.skin_refine_flux_klein_sync_lora_scale  = 1.0
+        self.skin_refine_flux_klein_sync_prompt      = "Enhance sharpness and detail, preserve structure. Realistic baby skin texture."
+        self.skin_refine_flux_klein_sync_guidance     = 1.4
+        self.skin_refine_flux_klein_sync_steps        = 40
+        self.skin_refine_flux_klein_sync_width        = 1024
+        self.skin_refine_flux_klein_sync_height       = 1024
+        self.skin_refine_flux_klein_sync_seed         = 42
+        self.skin_refine_flux_klein_sync_dtype        = "bfloat16"
+        self.skin_refine_flux_klein_sync_strength     = 0.15
+        self.skin_refine_flux_klein_sync_start        = 0.5
+        self.skin_refine_flux_klein_sync_end          = 0.9
+        self.skin_refine_flux_klein_sync_voxel_res    = 64
+        self.skin_refine_flux_klein_sync_num_passes   = 1
 
 class Hunyuan3DPaintPipeline:
     def __init__(self, config=None) -> None:
@@ -302,6 +320,25 @@ class Hunyuan3DPaintPipeline:
                     "align":       self.config.skin_refine_flux_klein_mv_align,
                     "align_conf":  self.config.skin_refine_flux_klein_mv_align_conf,
                     "align_feather": self.config.skin_refine_flux_klein_mv_align_feather,
+                    "use_normals": self.config.skin_refine_flux_klein_mv_use_normals,
+                }
+            elif rtype == "flux_klein_sync":
+                refiner_kwargs = {
+                    "model":       self.config.skin_refine_flux_klein_sync_model,
+                    "lora_path":   self.config.skin_refine_flux_klein_sync_lora_path,
+                    "lora_scale":  self.config.skin_refine_flux_klein_sync_lora_scale,
+                    "prompt":      self.config.skin_refine_flux_klein_sync_prompt,
+                    "guidance_scale": self.config.skin_refine_flux_klein_sync_guidance,
+                    "num_inference_steps": self.config.skin_refine_flux_klein_sync_steps,
+                    "width":       self.config.skin_refine_flux_klein_sync_width,
+                    "height":      self.config.skin_refine_flux_klein_sync_height,
+                    "seed":        self.config.skin_refine_flux_klein_sync_seed,
+                    "dtype":       self.config.skin_refine_flux_klein_sync_dtype,
+                    "device":      self.config.device,
+                    "sync_strength":    self.config.skin_refine_flux_klein_sync_strength,
+                    "sync_start":       self.config.skin_refine_flux_klein_sync_start,
+                    "sync_end":         self.config.skin_refine_flux_klein_sync_end,
+                    "voxel_resolution": self.config.skin_refine_flux_klein_sync_voxel_res,
                 }
             refiner = create_refiner(rtype, **refiner_kwargs)
         
@@ -309,14 +346,19 @@ class Hunyuan3DPaintPipeline:
             num_passes = self.config.skin_refine_flux_kontext_num_passes
         elif rtype == "flux_klein_multiview":
             num_passes = self.config.skin_refine_flux_klein_mv_num_passes
+            refine_resolution = self.config.skin_refine_flux_klein_mv_width
+        elif rtype == "flux_klein_sync":
+            num_passes = self.config.skin_refine_flux_klein_sync_num_passes
+            refine_resolution = self.config.skin_refine_flux_klein_sync_width
         else:
             num_passes = self.config.skin_refine_num_passes
+            refine_resolution = self.config.skin_refine_resolution
         self.models["skin_refiner"] = SkinTextureRefiner(
             refiner=refiner,
             num_passes=num_passes,
             blend_alpha=self.config.skin_refine_blend_alpha,
             grain_strength=self.config.skin_refine_grain,
-            refine_resolution=self.config.skin_refine_resolution,
+            refine_resolution=refine_resolution,
             device=self.config.device,
         )
         logger.info(f"[Pipeline] Custom skin refiner set: {refiner.name if hasattr(refiner, 'name') else refiner}")

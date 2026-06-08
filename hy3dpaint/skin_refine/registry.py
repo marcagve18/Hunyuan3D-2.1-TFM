@@ -98,6 +98,7 @@ from .refiners.nafnet import NAFNetRefiner
 from .refiners.flux_kontext import FluxKontextRefiner
 from .refiners.flux_klein import FluxKleinTiledRefiner
 from .refiners.flux_klein_multiview import FluxKleinMultiviewRefiner
+from .refiners.flux_klein_sync import FluxKleinSyncRefiner
 
 register_refiner("gfpgan")(GFPGANRefiner)
 register_refiner("codeformer")(CodeFormerRefiner)
@@ -108,3 +109,4 @@ register_refiner("nafnet")(NAFNetRefiner)
 register_refiner("flux_kontext")(FluxKontextRefiner)
 register_refiner("flux_klein")(FluxKleinTiledRefiner)
 register_refiner("flux_klein_multiview")(FluxKleinMultiviewRefiner)
+register_refiner("flux_klein_sync")(FluxKleinSyncRefiner)

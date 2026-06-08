@@ -171,9 +171,15 @@ class SkinTextureRefiner:
         textures_mr,  cos_maps_mr  = [], []
         n_restored = 0
 
+        _use_normals = getattr(self.refiner, "use_normals", False)
+
         for elev, azim in self.viewpoints:
             tag = f"az{azim:+04d}_el{elev:+03d}"
             rendered, _ = _render_view(render, elev, azim, res, "tex")
+
+            if _use_normals:
+                normal_pil = render.render_normal(elev, azim, resolution=(res, res), return_type="pl")
+                self.refiner._current_normal = normal_pil
 
             if debug_dir and pass_idx == 0:
                 _save_img(rendered.cpu().numpy(),
@@ -279,6 +285,75 @@ class SkinTextureRefiner:
 
         logger.info("[SkinRefiner] UV-space enhancement complete.")
 
+    def _has_multiview_sync_mode(self) -> bool:
+        return hasattr(self.refiner, "refine_multiview") and callable(self.refiner.refine_multiview)
+
+    def _run_multiview_sync_mode(self, render, debug_dir=None):
+        """Synchronized multiview: render all views, refine jointly, bake."""
+        logger.info("[SkinRefiner] Using multiview-sync mode (cross-view latent synchronisation).")
+        res = self.refine_resolution
+        orig_tex = render.tex.clone()
+        has_mr = hasattr(render, "tex_mr") and render.tex_mr is not None
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            _save_img(orig_tex.cpu().numpy(),
+                      os.path.join(debug_dir, "texture_input.png"))
+
+        # Render all views + position maps + normal maps
+        views = []
+        position_maps = []
+        normal_maps = []
+        for elev, azim in self.viewpoints:
+            rendered, _ = _render_view(render, elev, azim, res, "tex")
+            pil_view = Image.fromarray(
+                (rendered.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            )
+            views.append(pil_view)
+
+            pos = render.render_position(elev, azim, resolution=(res, res), return_type="th")
+            position_maps.append(pos.squeeze(0) if pos.dim() == 4 else pos)
+
+            normal_pil = render.render_normal(elev, azim, resolution=(res, res), return_type="pl")
+            normal_maps.append(normal_pil)
+
+        sync_debug = os.path.join(debug_dir, "sync_details") if debug_dir else None
+
+        # Joint refinement
+        refined_views = self.refiner.refine_multiview(
+            views=views,
+            position_maps=position_maps,
+            render=render,
+            normal_maps=normal_maps,
+            debug_dir=sync_debug,
+        )
+
+        # Back-project and bake
+        textures_enh, cos_maps_enh = [], []
+        for i, (elev, azim) in enumerate(self.viewpoints):
+            if refined_views[i] is None:
+                continue
+            tex_bp, cos_bp, _ = render.back_project(refined_views[i], elev, azim)
+            textures_enh.append(tex_bp)
+            cos_maps_enh.append(cos_bp)
+
+        if not textures_enh:
+            logger.warning("[SkinRefiner] No views refined — stopping.")
+            return
+
+        new_tex, valid_mask = render.fast_bake_texture(textures_enh, cos_maps_enh)
+        new_tex = self._to_float_tex(new_tex, orig_tex.device)
+        final_tex = self._blend(new_tex, valid_mask, render.tex)
+        render.set_texture(final_tex, force_set=True)
+
+        if self.grain_strength > 0:
+            self._apply_grain(render)
+
+        if debug_dir:
+            self._save_comparison(orig_tex, render.tex, debug_dir)
+
+        logger.info("[SkinRefiner] Multiview-sync enhancement complete.")
+
     def _apply_grain(self, render):
         """Add luminance-modulated grain to the current texture."""
         tex_final = render.tex.clone()
@@ -324,7 +399,14 @@ class SkinTextureRefiner:
         if self._has_uv_mode():
             return self._run_uv_mode(render, debug_dir)
 
+        # Synchronized multiview mode: all views processed jointly
+        if self._has_multiview_sync_mode():
+            return self._run_multiview_sync_mode(render, debug_dir)
+
         # Screen-space mode: multi-view render→restore→bake
+        if debug_dir and hasattr(self.refiner, "debug_dir"):
+            self.refiner.debug_dir = os.path.join(debug_dir, "klein_details")
+            self.refiner._view_counter = 0
         res    = self.refine_resolution
         orig_tex    = render.tex.clone()
         has_mr      = hasattr(render, "tex_mr") and render.tex_mr is not None
