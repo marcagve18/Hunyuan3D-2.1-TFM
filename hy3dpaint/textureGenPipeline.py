@@ -141,7 +141,8 @@ class Hunyuan3DPaintConfig:
         self.skin_refine_flux_klein_mv_align_conf = 0.9
         self.skin_refine_flux_klein_mv_align_feather = 2
         self.skin_refine_flux_klein_mv_num_passes = 1
-        self.skin_refine_flux_klein_mv_use_normals = True
+        self.skin_refine_flux_klein_mv_use_normals = False
+        self.skin_refine_flux_klein_mv_geometry_conditioning = "none"  # "none", "normals", or "depth"
 
         # FLUX.2-Klein synchronized multiview (SyncDiffusion-style latent blending)
         self.skin_refine_flux_klein_sync_model      = "black-forest-labs/FLUX.2-klein-base-4B"
@@ -321,6 +322,7 @@ class Hunyuan3DPaintPipeline:
                     "align_conf":  self.config.skin_refine_flux_klein_mv_align_conf,
                     "align_feather": self.config.skin_refine_flux_klein_mv_align_feather,
                     "use_normals": self.config.skin_refine_flux_klein_mv_use_normals,
+                    "geometry_conditioning": self.config.skin_refine_flux_klein_mv_geometry_conditioning,
                 }
             elif rtype == "flux_klein_sync":
                 refiner_kwargs = {
@@ -377,9 +379,12 @@ class Hunyuan3DPaintPipeline:
         manual_texture_path=None,    
         manual_mr_texture_path=None,
         skin_refiner=None,
+        geometry_conditioning=None,
     ):
         # Store refiner choice to apply after load_models
         _requested_refiner = skin_refiner
+        if geometry_conditioning is not None:
+            self.config.skin_refine_flux_klein_mv_geometry_conditioning = geometry_conditioning
         
         input_dir = os.path.dirname(mesh_path)
         if output_mesh_path is None:

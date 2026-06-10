@@ -75,6 +75,7 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
         align_conf: float = 0.9,
         align_feather: int = 2,
         use_normals: bool = False,
+        geometry_conditioning: str = "none",
     ):
         self.model_id = model
         self.lora_path = lora_path
@@ -90,12 +91,19 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
         self.align = align
         self.align_conf = align_conf
         self.align_feather = align_feather
-        self.use_normals = use_normals
+        # geometry_conditioning takes precedence; fall back to use_normals for backwards compat
+        if geometry_conditioning != "none":
+            self.geometry_conditioning = geometry_conditioning
+        elif use_normals:
+            self.geometry_conditioning = "normals"
+        else:
+            self.geometry_conditioning = "none"
+        self.use_normals = self.geometry_conditioning != "none"
         self._pipeline = None
         self._loftr = None
         self.debug_dir = None
         self._view_counter = 0
-        self._current_normal = None
+        self._current_geometry_map = None
 
     @property
     def name(self) -> str:
@@ -283,12 +291,12 @@ class FluxKleinMultiviewRefiner(BaseSkinRefiner):
                 image.save(f"{dbg_prefix}_input.png")
 
             klein_images = [img_resized]
-            if self.use_normals and self._current_normal is not None:
-                normal_resized = self._current_normal.convert("RGB").resize((w16, h16), Image.LANCZOS)
-                klein_images.append(normal_resized)
+            if self.geometry_conditioning != "none" and self._current_geometry_map is not None:
+                geo_resized = self._current_geometry_map.convert("RGB").resize((w16, h16), Image.LANCZOS)
+                klein_images.append(geo_resized)
                 if dbg_prefix:
-                    normal_resized.save(f"{dbg_prefix}_normal.png")
-                logger.info("[FluxKleinMV] Passing normal map as additional reference image")
+                    geo_resized.save(f"{dbg_prefix}_{self.geometry_conditioning}.png")
+                logger.info(f"[FluxKleinMV] Passing {self.geometry_conditioning} map as additional reference image")
 
             result = self._pipeline(
                 prompt=self.prompt,

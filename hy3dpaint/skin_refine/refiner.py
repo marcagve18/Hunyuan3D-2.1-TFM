@@ -120,11 +120,6 @@ class SkinTextureRefiner:
         (  0,   0),
         (  0,  30),
         (  0, -30),
-        ( 15,   0),
-        (-10,   0),
-        (  0,  60),
-        (  0, -60),
-        ( 15,  30),
     ]
 
     def __init__(
@@ -171,15 +166,28 @@ class SkinTextureRefiner:
         textures_mr,  cos_maps_mr  = [], []
         n_restored = 0
 
-        _use_normals = getattr(self.refiner, "use_normals", False)
+        _geo_cond = getattr(self.refiner, "geometry_conditioning", "none")
 
         for elev, azim in self.viewpoints:
             tag = f"az{azim:+04d}_el{elev:+03d}"
             rendered, _ = _render_view(render, elev, azim, res, "tex")
 
-            if _use_normals:
-                normal_pil = render.render_normal(elev, azim, resolution=(res, res), return_type="pl")
-                self.refiner._current_normal = normal_pil
+            if _geo_cond == "normals":
+                geo_pil = render.render_normal(elev, azim, resolution=(res, res), return_type="pl")
+                self.refiner._current_geometry_map = geo_pil
+            elif _geo_cond == "depth":
+                pos = render.render_position(elev, azim, resolution=(res, res), return_type="th")
+                pos_np = pos.squeeze(0).cpu().numpy() if pos.dim() == 4 else pos.cpu().numpy()
+                depth = np.linalg.norm(pos_np, axis=-1)
+                vis = depth > 1e-4
+                if vis.any():
+                    d_min, d_max = depth[vis].min(), depth[vis].max()
+                    depth_norm = np.where(vis, (depth - d_min) / max(d_max - d_min, 1e-6), 0)
+                else:
+                    depth_norm = np.zeros_like(depth)
+                depth_u8 = (depth_norm * 255).clip(0, 255).astype(np.uint8)
+                geo_pil = Image.fromarray(np.stack([depth_u8]*3, axis=-1))
+                self.refiner._current_geometry_map = geo_pil
 
             if debug_dir and pass_idx == 0:
                 _save_img(rendered.cpu().numpy(),
