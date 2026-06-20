@@ -362,6 +362,7 @@ class Hunyuan3DPaintPipeline:
             grain_strength=self.config.skin_refine_grain,
             refine_resolution=refine_resolution,
             device=self.config.device,
+            num_views=getattr(self, '_refiner_num_views', None),
         )
         logger.info(f"[Pipeline] Custom skin refiner set: {refiner.name if hasattr(refiner, 'name') else refiner}")
 
@@ -380,9 +381,11 @@ class Hunyuan3DPaintPipeline:
         manual_mr_texture_path=None,
         skin_refiner=None,
         geometry_conditioning=None,
+        refiner_num_views=None,
     ):
         # Store refiner choice to apply after load_models
         _requested_refiner = skin_refiner
+        self._refiner_num_views = refiner_num_views
         if geometry_conditioning is not None:
             self.config.skin_refine_flux_klein_mv_geometry_conditioning = geometry_conditioning
         

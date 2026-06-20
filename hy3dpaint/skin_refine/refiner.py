@@ -31,6 +31,7 @@ Available refiners: 'gfpgan', 'codeformer', 'none'
 """
 
 import os
+import json
 import logging
 import numpy as np
 import torch
@@ -122,6 +123,12 @@ class SkinTextureRefiner:
         (  0, -30),
     ]
 
+    @staticmethod
+    def _generate_viewpoints(n, arc_range=(-60, 60)):
+        """Generate n evenly-spaced (elev, azim) pairs over a frontal arc."""
+        azimuths = np.linspace(arc_range[0], arc_range[1], n)
+        return [(0, int(round(az))) for az in azimuths]
+
     def __init__(
         self,
         refiner: Optional[BaseSkinRefiner] = None,
@@ -134,6 +141,7 @@ class SkinTextureRefiner:
         refine_resolution: int = 512,
         device: str = "cuda",
         viewpoints: Optional[list] = None,
+        num_views: Optional[int] = None,
     ):
         if refiner is None:
             logger.info(f"[SkinRefiner] Creating refiner: {refiner_name}")
@@ -148,9 +156,14 @@ class SkinTextureRefiner:
         self.grain_seed = grain_seed
         self.refine_resolution = refine_resolution
         self.device = device
-        self.viewpoints = viewpoints or self._DEFAULT_VIEWPOINTS
+
+        if num_views is not None:
+            self.viewpoints = self._generate_viewpoints(num_views)
+        else:
+            self.viewpoints = viewpoints or self._DEFAULT_VIEWPOINTS
 
         logger.info(f"[SkinRefiner] Using refiner: {self.refiner.name}")
+        logger.info(f"[SkinRefiner] Viewpoints ({len(self.viewpoints)}): {self.viewpoints}")
 
     def _restore_view(self, rendered_hwc: torch.Tensor) -> Optional[np.ndarray]:
         """Apply the plugged-in refiner to one rendered view."""
@@ -387,6 +400,30 @@ class SkinTextureRefiner:
             os.path.join(debug_dir, "texture_comparison.png"))
         logger.info(f"[SkinRefiner] Debug images → {debug_dir}")
 
+    def _save_viewpoints_json(self, render, debug_dir):
+        """Save viewpoints + camera poses for pre-baking stereo reconstruction."""
+        camera_distance = render.camera_distance
+        ortho_scale = getattr(render, 'ortho_scale', 1.2)
+        views = []
+        for elev, azim in self.viewpoints:
+            w2c = get_mv_matrix(elev=elev, azim=azim,
+                                camera_distance=camera_distance)
+            views.append({
+                'elev': int(elev),
+                'azim': int(azim),
+                'w2c': w2c.tolist(),
+            })
+        data = {
+            'camera_distance': float(camera_distance),
+            'ortho_scale': float(ortho_scale),
+            'render_resolution': self.refine_resolution,
+            'views': views,
+        }
+        out_path = os.path.join(debug_dir, "viewpoints.json")
+        with open(out_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"[SkinRefiner] Viewpoints saved → {out_path}")
+
     def __call__(self, render, reference_images=None, debug_dir=None):
         """Enhance the texture currently loaded on *render* in-place.
 
@@ -424,6 +461,7 @@ class SkinTextureRefiner:
             os.makedirs(debug_dir, exist_ok=True)
             _save_img(orig_tex.cpu().numpy(),
                       os.path.join(debug_dir, "texture_input.png"))
+            self._save_viewpoints_json(render, debug_dir)
 
         for pass_idx in range(self.num_passes):
             new_tex, valid_mask, new_tex_mr, valid_mask_mr = self._run_one_pass(
